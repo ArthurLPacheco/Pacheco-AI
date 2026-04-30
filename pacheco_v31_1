@@ -267,11 +267,14 @@ REGRAS OBRIGATÓRIAS:
 1. Responda SEMPRE com exatamente um bloco ```python ... ``` contendo código funcional.
 2. Use apenas: os, json, datetime, re, math, random, pathlib, collections.
 3. O código deve ser independente (não dependa de variáveis externas).
-4. Inclua print() para mostrar resultados ao usuário.
+4. Inclua print() para mostrar resultados ao usuário. Se usar função, SEMPRE chame ela fora da função.
 5. Nunca use subprocess, requests, eval, exec, ou __import__.
 6. NUNCA use Path(__file__). O diretório raiz do projeto é SEMPRE: r"{cls.DIR_PROJETO}"
    Exemplo correto para abrir arquivo: open(r"{cls.DIR_PROJETO}/Sandbox/estoque.json")
-7. Todo print() deve ser uma expressão simples, NUNCA coloque ':' depois do parêntese de fechamento."""
+7. Todo print() deve ser uma expressão simples, NUNCA coloque ':' depois do parêntese de fechamento.
+8. ESCREVA APENAS EM PORTUGUÊS. Nomes de variáveis, comentários e textos SOMENTE em português.
+   PROIBIDO usar espanhol: 'productos', 'costo', 'precio' são ERROS GRAVES. Use: 'produtos', 'custo', 'preco'.
+9. Revise TODAS as variáveis antes de usar. Nunca use uma variável com nome diferente do que foi definido."""
 
     @staticmethod
     def inicial(pergunta: str, contexto: str, solucao_anterior: str | None) -> str:
