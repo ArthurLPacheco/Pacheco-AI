@@ -1,4 +1,4 @@
-# 🤖 Pacheco AI Ω — v31.2 (v2.0)
+# 🤖 Pacheco AI Ω — v31.3 (v2.0)
 ### The Self-Healing, Autonomous Agent by LIMA CORP
 
 Pacheco AI is a self-healing, LLM-driven development agent designed to bridge the gap between AI-generated logic and local execution. Operating under the **LIMA CORP** methodology, it utilizes a modular, Object-Oriented architecture to write, test, and repair Python scripts in real-time within a secure, AST-monitored sandbox environment.
@@ -48,4 +48,4 @@ The system follows a **Zero-Leakage Security Protocol** and an automated organiz
 1. Clone the repository.
 2. Launch the core engine:
 ```bash
-python pacheco_v31_2.py
+python pacheco_v31_3.py
