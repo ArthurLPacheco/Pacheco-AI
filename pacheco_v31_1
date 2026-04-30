@@ -1,0 +1,554 @@
+"""
+╔══════════════════════════════════════════════════════════╗
+║           PACHECO AI Ω — v2.0 | LIMA CORP               ║
+║     Base para um sistema de IA evolutivo e autônomo      ║
+╚══════════════════════════════════════════════════════════╝
+
+ARQUITETURA:
+  - Motor:       Ollama local (phi3:3.8b ou qualquer modelo)
+  - Memória:     Curto prazo (conversa) + Longo prazo (JSON)
+  - Segurança:   Análise de AST antes de executar qualquer código
+  - Retry:       Autocorreção automática com contexto de erro
+  - Habilidades: Sistema modular para adicionar capacidades
+"""
+
+import ast
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import requests
+
+# ══════════════════════════════════════════════
+#  CONFIGURAÇÃO
+# ══════════════════════════════════════════════
+
+CONFIG = {
+    "modelo": "phi3:3.8b",
+    "url_ollama": "http://localhost:11434/api/generate",
+    "timeout": 300,
+    "temperatura": 0.1,
+    "max_tentativas_correcao": 2,
+    "limite_memoria_curta": 5,       # Últimas N interações na conversa
+    "limite_memoria_longa": 100,     # Máximo de entradas no arquivo de memória
+    "timeout_execucao": 15,          # Segundos para rodar o código gerado
+}
+
+DIRETORIOS = {
+    "sandbox":   "Sandbox",
+    "projetos":  "Projetos_Ativos",
+    "memoria":   "Memoria",
+    "logs":      "Logs",
+    "habilidades": "Habilidades",
+}
+
+REGEX_CODIGO = re.compile(r'```python\n(.*?)\n```', re.DOTALL)
+
+# Chamadas perigosas que bloqueamos antes de executar
+CHAMADAS_BLOQUEADAS = {
+    # Acesso ao sistema
+    "os.system", "os.popen", "os.remove", "os.rmdir",
+    "shutil.rmtree", "shutil.move",
+    # Execução de processos
+    "subprocess.run", "subprocess.call", "subprocess.Popen",
+    # Rede (remover se quiser permitir futuramente)
+    "urllib", "requests", "socket",
+    # Eval/exec recursivo
+    "eval", "exec", "compile",
+    # Leitura de arquivos fora do sandbox (básico)
+    "__import__",
+}
+
+# ══════════════════════════════════════════════
+#  SISTEMA DE MEMÓRIA
+# ══════════════════════════════════════════════
+
+class Memoria:
+    """
+    Memória de dois níveis:
+      - Curto prazo: lista em RAM, descartada ao sair
+      - Longo prazo: arquivo JSON persistente entre sessões
+    """
+
+    def __init__(self, caminho_arquivo: str):
+        self.curto_prazo: list[dict] = []
+        self.arquivo = Path(caminho_arquivo)
+        self.longo_prazo: list[dict] = self._carregar()
+
+    def _carregar(self) -> list:
+        if self.arquivo.exists():
+            try:
+                with open(self.arquivo, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return []
+        return []
+
+    def _salvar(self):
+        with open(self.arquivo, "w", encoding="utf-8") as f:
+            json.dump(self.longo_prazo[-CONFIG["limite_memoria_longa"]:], f,
+                      ensure_ascii=False, indent=2)
+
+    def adicionar(self, usuario: str, resposta_ia: str, codigo_gerado: str = "", sucesso: bool = False):
+        entrada = {
+            "timestamp": datetime.now().isoformat(),
+            "usuario": usuario,
+            "resposta_ia": resposta_ia,
+            "codigo_gerado": codigo_gerado,
+            "sucesso": sucesso,
+        }
+        # Curto prazo (RAM)
+        self.curto_prazo.append(entrada)
+        if len(self.curto_prazo) > CONFIG["limite_memoria_curta"]:
+            self.curto_prazo.pop(0)
+
+        # Longo prazo (apenas interações com código bem-sucedido)
+        if sucesso and codigo_gerado:
+            self.longo_prazo.append(entrada)
+            self._salvar()
+
+    def contexto_recente(self) -> str:
+        if not self.curto_prazo:
+            return "(nenhum histórico ainda)"
+        linhas = []
+        for h in self.curto_prazo:
+            linhas.append(f"User: {h['usuario']}")
+            linhas.append(f"Pacheco: {h['resposta_ia'][:300]}...")
+        return "\n".join(linhas)
+
+    def buscar_solucao_anterior(self, pergunta: str) -> str | None:
+        """Busca no longo prazo se já resolvemos algo parecido."""
+        palavras = set(pergunta.lower().split())
+        for entrada in reversed(self.longo_prazo):
+            palavras_entrada = set(entrada["usuario"].lower().split())
+            similaridade = len(palavras & palavras_entrada) / max(len(palavras), 1)
+            if similaridade > 0.5 and entrada["codigo_gerado"]:
+                return entrada["codigo_gerado"]
+        return None
+
+
+# ══════════════════════════════════════════════
+#  SEGURANÇA — ANÁLISE DE AST
+# ══════════════════════════════════════════════
+
+class AnalisadorSeguranca:
+    """
+    Analisa o código Python gerado pela IA antes de executar.
+    Usa AST (Abstract Syntax Tree) para encontrar chamadas perigosas
+    sem precisar executar nada.
+    """
+
+    @staticmethod
+    def analisar(codigo: str) -> tuple[bool, str]:
+        """
+        Retorna (seguro, motivo).
+        seguro=True significa que pode executar.
+        """
+        # 1. Verifica se é Python válido
+        try:
+            arvore = ast.parse(codigo)
+        except SyntaxError as e:
+            return False, f"Erro de sintaxe: {e}"
+
+        # 2. Percorre todos os nós da árvore
+        for no in ast.walk(arvore):
+
+            # Chamadas de função: os.system("rm -rf /")
+            if isinstance(no, ast.Call):
+                nome_chamada = AnalisadorSeguranca._nome_chamada(no)
+                for bloqueado in CHAMADAS_BLOQUEADAS:
+                    if nome_chamada and bloqueado in nome_chamada:
+                        return False, f"Chamada bloqueada por segurança: '{nome_chamada}'"
+
+            # Import de módulos bloqueados
+            if isinstance(no, (ast.Import, ast.ImportFrom)):
+                modulos = (
+                    [alias.name for alias in no.names]
+                    if isinstance(no, ast.Import)
+                    else [no.module or ""]
+                )
+                for modulo in modulos:
+                    if modulo and any(b.split(".")[0] == modulo.split(".")[0]
+                                      for b in CHAMADAS_BLOQUEADAS):
+                        # Permite os e json (usados legítimamente)
+                        if modulo not in ("os", "json", "datetime", "re",
+                                          "math", "random", "string", "pathlib",
+                                          "collections", "itertools", "functools"):
+                            return False, f"Import bloqueado: '{modulo}'"
+
+        return True, "OK"
+
+    @staticmethod
+    def _nome_chamada(no: ast.Call) -> str | None:
+        """Extrai o nome completo de uma chamada (ex: 'os.system')."""
+        if isinstance(no.func, ast.Attribute):
+            if isinstance(no.func.value, ast.Name):
+                return f"{no.func.value.id}.{no.func.attr}"
+        if isinstance(no.func, ast.Name):
+            return no.func.id
+        return None
+
+
+# ══════════════════════════════════════════════
+#  EXECUTOR DE CÓDIGO
+# ══════════════════════════════════════════════
+
+class Executor:
+    """Salva e executa código gerado pela IA no diretório Sandbox."""
+
+    def __init__(self, sandbox: str):
+        self.sandbox = Path(sandbox)
+
+    def executar(self, codigo: str) -> tuple[bool, str]:
+        # Segurança primeiro
+        seguro, motivo = AnalisadorSeguranca.analisar(codigo)
+        if not seguro:
+            return False, f"[BLOQUEADO pela análise de segurança] {motivo}"
+
+        # Salva arquivo
+        nome = f"exec_{int(time.time())}.py"
+        caminho = self.sandbox / nome
+        caminho.write_text(codigo, encoding="utf-8")
+
+        try:
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            resultado = subprocess.run(
+                [sys.executable, "-X", "frozen_modules=off", str(caminho)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=CONFIG["timeout_execucao"],
+                env=env,
+            )
+            # Filtra linhas de lixo do debugger
+            linhas_limpas = [
+                l for l in (resultado.stdout + resultado.stderr).splitlines()
+                if not any(ruido in l for ruido in (
+                    "Debugger warning", "frozen modules", "pydevd",
+                    "PYDEVD", "0.00s -", "0.02s -", "debugger"
+                ))
+            ]
+            saida = "\n".join(linhas_limpas).strip()
+            return resultado.returncode == 0, saida or "(sem saída)"
+        except subprocess.TimeoutExpired:
+            return False, "Timeout: o código demorou mais de 15 segundos."
+        except Exception as e:
+            return False, f"Erro ao executar: {e}"
+        finally:
+            # Limpa o arquivo após execução
+            try:
+                caminho.unlink()
+            except Exception:
+                pass
+
+
+# ══════════════════════════════════════════════
+#  CONSTRUTOR DE PROMPTS
+# ══════════════════════════════════════════════
+
+class PromptBuilder:
+    """Monta os prompts enviados ao modelo."""
+
+    # DIR_PROJETO é injetado em runtime pelo PachecoAI
+    DIR_PROJETO: str = ""
+
+    @classmethod
+    def _sistema(cls) -> str:
+        return f"""Você é o Pacheco AI, assistente de IA da LIMA CORP.
+Especialidades: Python, Gestão de Estoque, automações.
+REGRAS OBRIGATÓRIAS:
+1. Responda SEMPRE com exatamente um bloco ```python ... ``` contendo código funcional.
+2. Use apenas: os, json, datetime, re, math, random, pathlib, collections.
+3. O código deve ser independente (não dependa de variáveis externas).
+4. Inclua print() para mostrar resultados ao usuário.
+5. Nunca use subprocess, requests, eval, exec, ou __import__.
+6. NUNCA use Path(__file__). O diretório raiz do projeto é SEMPRE: r"{cls.DIR_PROJETO}"
+   Exemplo correto para abrir arquivo: open(r"{cls.DIR_PROJETO}/Sandbox/estoque.json")
+7. Todo print() deve ser uma expressão simples, NUNCA coloque ':' depois do parêntese de fechamento."""
+
+    @staticmethod
+    def inicial(pergunta: str, contexto: str, solucao_anterior: str | None) -> str:
+        partes = [
+            PromptBuilder._sistema(),
+            f"\nHISTÓRICO RECENTE:\n{contexto}",
+        ]
+        if solucao_anterior:
+            partes.append(
+                f"\nREFERÊNCIA (solução similar do passado):\n```python\n{solucao_anterior}\n```"
+            )
+        partes.append(f"\nTAREFA: {pergunta}")
+        return "\n".join(partes)
+
+    @staticmethod
+    def correcao(pergunta: str, codigo_falho: str, erro: str, tentativa: int) -> str:
+        sistema = PromptBuilder._sistema()
+        dir_proj = PromptBuilder.DIR_PROJETO
+        return (
+            f"{sistema}\n\n"
+            f"TAREFA ORIGINAL: {pergunta}\n\n"
+            f"TENTATIVA {tentativa} FALHOU.\n"
+            f"CÓDIGO COM ERRO:\n```python\n{codigo_falho}\n```\n\n"
+            f"MENSAGEM DE ERRO:\n{erro}\n\n"
+            f"CORRIJA o código. Use r\"{dir_proj}\" como diretório raiz.\n"
+            f"Responda APENAS com o bloco ```python corrigido."
+        )
+
+
+# ══════════════════════════════════════════════
+#  CLIENTE OLLAMA
+# ══════════════════════════════════════════════
+
+class ClienteOllama:
+    """Gerencia a comunicação com o servidor Ollama."""
+
+    def __init__(self):
+        self.session = requests.Session()
+
+    def gerar(self, prompt: str, mostrar_stream: bool = True) -> str:
+        """Envia prompt e retorna a resposta completa."""
+        payload = {
+            "model": CONFIG["modelo"],
+            "prompt": prompt,
+            "stream": True,
+            "options": {"temperature": CONFIG["temperatura"]},
+        }
+        resposta = ""
+        try:
+            with self.session.post(
+                CONFIG["url_ollama"],
+                json=payload,
+                stream=True,
+                timeout=CONFIG["timeout"],
+            ) as r:
+                r.raise_for_status()
+                for line in r.iter_lines():
+                    if line:
+                        token = json.loads(line.decode()).get("response", "")
+                        if mostrar_stream:
+                            print(token, end="", flush=True)
+                        resposta += token
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError(
+                "Não foi possível conectar ao Ollama. "
+                "Verifique se ele está rodando: `ollama serve`"
+            )
+        return resposta
+
+    def verificar_conexao(self) -> bool:
+        try:
+            r = self.session.get("http://localhost:11434", timeout=3)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+
+# ══════════════════════════════════════════════
+#  LOGGER
+# ══════════════════════════════════════════════
+
+class Logger:
+    def __init__(self, caminho: str):
+        self.arquivo = Path(caminho) / f"sessao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    def log(self, nivel: str, mensagem: str):
+        linha = f"[{datetime.now().strftime('%H:%M:%S')}] [{nivel}] {mensagem}\n"
+        with open(self.arquivo, "a", encoding="utf-8") as f:
+            f.write(linha)
+
+
+# ══════════════════════════════════════════════
+#  PACHECO AI — NÚCLEO PRINCIPAL
+# ══════════════════════════════════════════════
+
+class PachecoAI:
+    """
+    Orquestra todos os componentes do sistema.
+    Este é o 'cérebro' do Pacheco AI.
+    """
+
+    def __init__(self):
+        self._inicializar_estrutura()
+        # Injeta o diretório raiz do projeto nos prompts
+        PromptBuilder.DIR_PROJETO = str(Path(__file__).parent.resolve())
+        self.memoria = Memoria(
+            os.path.join(DIRETORIOS["memoria"], "memoria_longa.json")
+        )
+        self.executor = Executor(DIRETORIOS["sandbox"])
+        self.cliente = ClienteOllama()
+        self.logger = Logger(DIRETORIOS["logs"])
+
+    def _inicializar_estrutura(self):
+        for pasta in DIRETORIOS.values():
+            os.makedirs(pasta, exist_ok=True)
+
+    def processar(self, pergunta: str) -> dict:
+        """
+        Processa uma pergunta e tenta gerar + executar código.
+        Retorna um dict com os detalhes da execução.
+        """
+        resultado = {
+            "pergunta": pergunta,
+            "resposta": "",
+            "codigo": "",
+            "saida": "",
+            "sucesso": False,
+            "tentativas": 0,
+        }
+
+        # Só busca solução anterior se a pergunta envolver arquivos/estoque
+        palavras_chave_arquivo = ("arquivo", "json", "estoque", "salv", "leia", "ler", "venda", "produto")
+        usar_memoria = any(p in pergunta.lower() for p in palavras_chave_arquivo)
+        solucao_anterior = self.memoria.buscar_solucao_anterior(pergunta) if usar_memoria else None
+        if solucao_anterior:
+            print("\n[💾 Memória] Encontrei uma solução similar no histórico.\n")
+
+        codigo_atual = ""
+        erro_atual = ""
+
+        for tentativa in range(1, CONFIG["max_tentativas_correcao"] + 2):
+            resultado["tentativas"] = tentativa
+
+            # Monta o prompt certo
+            if tentativa == 1:
+                prompt = PromptBuilder.inicial(
+                    pergunta,
+                    self.memoria.contexto_recente(),
+                    solucao_anterior,
+                )
+            else:
+                print(f"\n[🔄 Tentativa {tentativa}] Corrigindo erro anterior...\n")
+                prompt = PromptBuilder.correcao(
+                    pergunta, codigo_atual, erro_atual, tentativa
+                )
+
+            # Chama o modelo
+            print(f"\n{'─'*50}")
+            resposta = self.cliente.gerar(prompt)
+            resultado["resposta"] = resposta
+            print()  # linha após o stream
+
+            # Extrai código da resposta
+            blocos = REGEX_CODIGO.findall(resposta)
+            if not blocos:
+                print("[⚠️] Nenhum bloco de código encontrado na resposta.")
+                self.logger.log("AVISO", f"Sem código para: {pergunta}")
+                break
+
+            codigo_atual = blocos[0]
+            resultado["codigo"] = codigo_atual
+
+            # Executa
+            sucesso, saida = self.executor.executar(codigo_atual)
+            resultado["saida"] = saida
+            resultado["sucesso"] = sucesso
+
+            print(f"\n{'─'*50}")
+            print(f"[{'✅ SUCESSO' if sucesso else '❌ FALHOU'}] {saida}")
+
+            if sucesso:
+                self.logger.log("SUCESSO", f"Pergunta: {pergunta[:80]}")
+                break
+            else:
+                erro_atual = saida
+                self.logger.log("ERRO", f"Tentativa {tentativa}: {saida[:200]}")
+
+        # Salva na memória
+        self.memoria.adicionar(
+            usuario=pergunta,
+            resposta_ia=resultado["resposta"],
+            codigo_gerado=resultado["codigo"],
+            sucesso=resultado["sucesso"],
+        )
+
+        return resultado
+
+    def executar_loop(self):
+        """Loop principal de interação com o usuário."""
+        print("\n" + "═"*55)
+        print("  PACHECO AI Ω — v2.0 | LIMA CORP")
+        print("  Sistema de IA Evolutivo")
+        print("═"*55)
+
+        # Verifica conexão com Ollama
+        if not self.cliente.verificar_conexao():
+            print("\n[ERRO CRÍTICO] Ollama não está rodando!")
+            print("Execute: ollama serve")
+            print(f"E baixe o modelo: ollama pull {CONFIG['modelo']}")
+            return
+
+        print(f"\n✅ Conectado ao Ollama | Modelo: {CONFIG['modelo']}")
+        print(f"💾 Memória longa: {len(self.memoria.longo_prazo)} entradas")
+        print("\nComandos especiais:")
+        print("  'memoria'  → ver histórico da sessão")
+        print("  'config'   → ver configurações")
+        print("  'sair'     → encerrar")
+        print("\nPara enviar um comando, termine com '---' em uma linha.\n")
+
+        while True:
+            try:
+                print("\n" + "─"*55)
+                print("📝 COMANDO (termine com '---'):")
+                linhas = []
+                while True:
+                    linha = input()
+                    if linha.strip() == "---":
+                        break
+                    linhas.append(linha)
+
+                user_input = "\n".join(linhas).strip()
+                if not user_input:
+                    continue
+
+                # Comandos internos
+                if user_input.lower() in ("sair", "exit", "quit"):
+                    print("\n👋 Até mais!")
+                    break
+
+                if user_input.lower() == "memoria":
+                    self._mostrar_memoria()
+                    continue
+
+                if user_input.lower() == "config":
+                    print(json.dumps(CONFIG, indent=2, ensure_ascii=False))
+                    continue
+
+                # Processa com IA
+                self.processar(user_input)
+
+            except KeyboardInterrupt:
+                print("\n\n[Interrompido] Use 'sair' para encerrar.")
+            except RuntimeError as e:
+                print(f"\n[ERRO DE CONEXÃO] {e}")
+                break
+            except Exception as e:
+                print(f"\n[ERRO INESPERADO] {e}")
+                self.logger.log("ERRO_FATAL", str(e))
+
+    def _mostrar_memoria(self):
+        print("\n── MEMÓRIA DA SESSÃO ATUAL ──")
+        if not self.memoria.curto_prazo:
+            print("(vazia)")
+            return
+        for i, h in enumerate(self.memoria.curto_prazo, 1):
+            ts = h["timestamp"][:19].replace("T", " ")
+            status = "✅" if h["sucesso"] else "❌"
+            print(f"\n{i}. [{ts}] {status}")
+            print(f"   Pergunta: {h['usuario'][:70]}...")
+
+        print(f"\n── MEMÓRIA LONGA: {len(self.memoria.longo_prazo)} soluções salvas ──")
+
+
+# ══════════════════════════════════════════════
+#  ENTRADA
+# ══════════════════════════════════════════════
+
+if __name__ == "__main__":
+    ai = PachecoAI()
+    ai.executar_loop()
