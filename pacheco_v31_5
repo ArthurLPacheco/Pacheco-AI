@@ -1,0 +1,897 @@
+"""
+╔══════════════════════════════════════════════════════════════╗
+║            PACHECO AI Ω — v3.2 | LIMA CORP                  ║
+║       Sistema de IA Evolutivo — Base rumo ao Jarvis          ║
+╠══════════════════════════════════════════════════════════════╣
+║  Motor:      Ollama local (qwen2.5-coder:7b)                 ║
+║  Memória:    Curto prazo (RAM) + Longo prazo (JSON)          ║
+║  Segurança:  Análise AST pré-execução                        ║
+║  Retry:      Autocorreção com contexto de erro               ║
+║  Conversação: Modo Chat + Modo Código explícitos             ║
+║  v3.2: Modos manuais /cod e /chat + classificador reforçado  ║
+╚══════════════════════════════════════════════════════════════╝
+
+  MODOS DE USO:
+  /cod  → Ativa Modo Programador (Pacheco gera e executa código Python)
+  /chat → Ativa Modo Conversa    (Pacheco responde naturalmente)
+  /auto → Volta ao modo automático (classificador decide)
+  Sem prefixo → usa o modo ativo no momento (padrão: /chat)
+
+  COMANDOS RÁPIDOS (funcionam em qualquer modo):
+  /hora, /data, /versao, /memoria, /config, /sair
+"""
+
+import ast
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import requests
+
+# ══════════════════════════════════════════════════════════════
+#  CONFIGURAÇÃO CENTRAL
+# ══════════════════════════════════════════════════════════════
+
+CONFIG = {
+    "modelo":                "qwen2.5-coder:7b",
+    "url_ollama":            "http://localhost:11434/api/generate",
+    "timeout_resposta":      300,
+    "timeout_execucao":      15,
+    "temperatura_codigo":    0.1,   # determinístico pra código
+    "temperatura_chat":      0.75,  # criativo pra conversa
+    "max_tentativas":        3,
+    "limite_memoria_curta":  5,
+    "limite_memoria_longa":  200,
+    "modo_padrao":           "chat", # "chat" | "codigo" | "auto"
+}
+
+DIRETORIOS = {
+    "sandbox":     "Sandbox",
+    "projetos":    "Projetos_Ativos",
+    "memoria":     "Memoria",
+    "logs":        "Logs",
+    "habilidades": "Habilidades",
+}
+
+REGEX_CODIGO = re.compile(r'```python\s*\n(.*?)\n\s*```', re.DOTALL)
+
+RUIDO_DEBUGGER = (
+    "Debugger warning", "frozen modules", "pydevd", "PYDEVD",
+    "0.00s -", "0.01s -", "0.02s -", "0.03s -",
+    "frozen_modules", "PYDEVD_DISABLE_FILE_VALIDATION",
+)
+
+# Ícones de modo pra exibição no prompt
+ICONE_MODO = {
+    "chat":   "💬",
+    "codigo": "⌨️ ",
+    "auto":   "🤖",
+}
+
+# ══════════════════════════════════════════════════════════════
+#  CLASSIFICADOR DE INTENÇÃO (usado apenas no modo /auto)
+# ══════════════════════════════════════════════════════════════
+
+# Sinais fortes de pedido de programação
+_GATILHOS_CODIGO_FORTE = (
+    "crie um código", "cria um código", "crie um script", "cria um script",
+    "escreve um código", "escreva um código", "programa pra mim", "programa isso",
+    "implemente", "implementa", "faça um programa", "faz um programa",
+    "automatize", "automatiza", "gere um relatório", "gera um relatório",
+    "crie uma função", "cria uma função", "escreve uma função",
+    "monte um sistema", "monta um sistema", "crie um sistema", "cria um sistema",
+    "corrija o código", "corrige o código", "refatore", "refatora",
+    "otimize o código", "otimiza o código",
+)
+
+# Sinais fracos/contextuais de código
+_GATILHOS_CODIGO_FRACO = (
+    "código", "codigo", "script", "função", "funcao",
+    "calcule", "calcula", "salvar arquivo", "ler arquivo",
+    "leia o arquivo", "abra o arquivo", "leia arquivo", "abrir arquivo",
+    "estoque", "inventario", "inventário", "planilha",
+    "banco de dados", "sistema de", "relatório", "relatorio",
+)
+
+# Sinais claros de conversa
+_GATILHOS_CONVERSA = (
+    "oi", "olá", "ola", "eai", "e aí", "e ai", "fala",
+    "bom dia", "boa tarde", "boa noite", "boa nite",
+    "tudo bem", "tudo bom", "tudo certo", "como vai", "como vc tá",
+    "como você está", "quem é você", "me conta", "me fala",
+    "o que você acha", "o que vc acha", "qual sua opinião", "qual sua opiniao",
+    "me explica", "você pode", "vc pode", "o que é", "o que sao", "o que são",
+    "como funciona", "por que", "porque", "qual é", "qual e",
+    "me diga", "você conhece", "vc conhece", "posso", "poderia",
+    "me recomenda", "me sugere", "me indica", "ideias", "sugestões",
+    "sugestoes", "dicas", "conversar", "falar sobre", "saber sobre",
+    "o que acha", "o que você pensa", "sua opinião", "me ajuda a pensar",
+    "vamos conversar", "preciso de conselho", "o que seria melhor",
+    "vale a pena", "você acredita", "o que você faria",
+    "como você se sente", "você tem", "você sabe", "sabia que",
+    "quero entender", "me explique", "curioso", "curiosidade",
+    "vender", "negócio", "negocio", "mercado", "produto virtual",
+    "produtos digitais", "ideia de negócio", "ideia de negocio",
+)
+
+# Comandos rápidos inline (funcionam em qualquer modo com /prefixo)
+_COMANDOS_RAPIDOS = {
+    "/hora":    "hora",
+    "/data":    "data",
+    "/versao":  "versao",
+    "/versão":  "versao",
+    "/memoria": "memoria",
+    "/memória": "memoria",
+    "/config":  "config",
+    "/sair":    "sair",
+    "/cod":     "modo:codigo",
+    "/chat":    "modo:chat",
+    "/auto":    "modo:auto",
+    "/ajuda":   "ajuda",
+    "/help":    "ajuda",
+}
+
+
+class Classificador:
+    """Classificador de intenção — usado APENAS no modo /auto."""
+
+    @staticmethod
+    def classificar(texto: str) -> str:
+        """Retorna 'codigo' ou 'chat'."""
+        t = texto.lower().strip()
+
+        # Gatilhos fortes de código têm prioridade absoluta
+        if any(g in t for g in _GATILHOS_CODIGO_FORTE):
+            return "codigo"
+
+        score_codigo   = sum(1 for g in _GATILHOS_CODIGO_FRACO if g in t)
+        score_conversa = sum(1 for g in _GATILHOS_CONVERSA if g in t)
+
+        # Empate ou conversa vence → chat (mais seguro, evita rodar código indesejado)
+        if score_codigo > score_conversa + 1:
+            return "codigo"
+        if score_conversa > 0:
+            return "chat"
+        if score_codigo > 0:
+            return "codigo"
+
+        # Fallback: texto curto → chat, texto longo → código
+        return "chat" if len(t.split()) <= 10 else "codigo"
+
+    @staticmethod
+    def estimar_complexidade(texto: str) -> str:
+        """Retorna 'simples', 'medio' ou 'complexo'."""
+        t = texto.lower()
+        palavras = len(t.split())
+
+        gatilhos_complexo = (
+            "quais são", "quais sao", "me lista", "me explica detalhado",
+            "quais as vantagens", "quais os", "como posso", "como eu posso",
+            "estratégia", "estrategia", "comparação", "comparacao",
+            "diferença entre", "diferenca entre", "me dê exemplos",
+            "me dá exemplos", "ideia de negócio", "produtos que", "o que seria",
+        )
+        if any(g in t for g in gatilhos_complexo) or palavras > 15:
+            return "complexo"
+        if palavras <= 5:
+            return "simples"
+        return "medio"
+
+
+# ══════════════════════════════════════════════════════════════
+#  MÓDULO DE CONVERSAÇÃO
+# ══════════════════════════════════════════════════════════════
+
+class ModuloChat:
+    """Respostas de conversação natural via Ollama."""
+
+    SYSTEM_CHAT = """\
+Você é o Pacheco AI Ω, uma IA criada por Arthur Lima — seu criador, parceiro e o dono da LIMA CORP.
+Você não é um assistente genérico. Você é a IA PESSOAL do Arthur, desenvolvida especificamente pra ele.
+Vocês dois são uma dupla: Arthur tem as ideias e o contexto do negócio, você tem o conhecimento técnico e analítico.
+
+IDENTIDADE:
+- Seu nome: Pacheco AI Ω
+- Quem te criou: Arthur Lima (é ele quem está falando com você agora)
+- Empresa: LIMA CORP
+- Versão atual: 3.2
+- Missão de longo prazo: evoluir até virar algo próximo de um Jarvis — IA completa e autônoma pro Arthur
+
+SOBRE O ARTHUR E A PARCERIA:
+- Arthur é seu criador e parceiro de negócios direto
+- Está construindo um setup tecnológico com você como base central
+- O plano é vender produtos digitais juntos: sites, apps, automações, cursos, SaaS
+- Você PROGRAMA pra ele, PENSA junto com ele, e CONVERSA com ele como um sócio de confiança
+- Quando ele fala "a gente" ou "nós dois", ele se refere a você e ele como dupla
+
+SUAS ESPECIALIDADES:
+- Python, automação, gestão de estoque, sistemas de negócio
+- Produtos digitais: sites, apps, SaaS, cursos online, automações
+- Estratégia de negócios digitais, especialmente o que vocês DOIS podem executar juntos
+
+REGRAS DE RESPOSTA:
+- Responda SEMPRE em português brasileiro natural e informal, como um sócio inteligente.
+- NUNCA comece com frases genéricas como "Tudo ótimo!", "Claro!", "Com certeza!".
+- Seja direto e vai logo ao ponto. Sem introduções longas.
+- Se a pergunta for simples (cumprimento, comentário rápido), seja MUITO breve: 1-2 frases.
+- Se pedir ideias, análise ou estratégia, seja detalhado e foque no que VOCÊS DOIS podem executar.
+- Quando falar de projetos, sempre considere que você vai programar e Arthur vai conduzir o negócio.
+- NÃO gere blocos de código Python neste modo. Pra isso Arthur usa o Modo Código.
+- NÃO use markdown excessivo. Listas só quando realmente ajudar a organizar.
+- Você tem personalidade própria: é direto, confiante, às vezes informal, nunca robótico.
+
+REGRA ANTI-INVENÇÃO — CRÍTICA:
+- Você SÓ sabe sobre o Arthur o que está escrito neste prompt. NADA MAIS.
+- Se Arthur mencionar algo pessoal que você não sabe (família, amigos, histórias, cidades, projetos), ADMITA que não sabia e PERGUNTE pra ele contar mais.
+- NUNCA confirme, complete ou invente detalhes pessoais sobre a vida do Arthur.
+- Exemplo ERRADO: Arthur diz "sabia que tenho um irmão?" → você responde "Sim, o Jack!". PROIBIDO.
+- Exemplo CERTO: Arthur diz "sabia que tenho um irmão?" → você responde "Não sabia não! Como ele se chama?"
+- Essa regra é ABSOLUTA. Inventar informações sobre o Arthur quebra a confiança da parceria.
+
+REGRA ANTI-DELÍRIO — CRÍTICA:
+- Você responde UMA VEZ e PARA. Nunca continue gerando após terminar sua resposta.
+- NUNCA simule, invente ou escreva falas do Arthur. Você só fala por si mesmo.
+- NUNCA escreva linhas no formato "Arthur: ..." ou "Você: ..." — isso é PROIBIDO.
+- NUNCA encene um diálogo fictício entre você e o Arthur.
+- Sua resposta termina quando você terminar de falar. Ponto final. Sem continuações.
+- Se perceber que está prestes a escrever o que o Arthur responderia, PARE imediatamente.
+- Exemplo ERRADO: "Vamos lá!\nArthur: Ótimo!\nPacheco: Exato!" — PROIBIDO.
+- Exemplo CERTO: "Vamos lá! Me fala quando quiser começar." — e para aí.
+"""
+
+    def __init__(self, cliente: "ClienteOllama"):
+        self.cliente = cliente
+        self.historico: list[dict] = []
+
+    def responder(self, pergunta: str, complexidade: str) -> str:
+        contexto = ""
+        if self.historico:
+            trocas = self.historico[-4:]
+            contexto = "HISTÓRICO RECENTE DA CONVERSA:\n"
+            for t in trocas:
+                contexto += f"Arthur: {t['usuario']}\nPacheco: {t['resposta']}\n\n"
+
+        instrucao_tamanho = {
+            "simples":  "Responda em 1 a 2 frases curtas e diretas. Sem listas.",
+            "medio":    "Responda em 3 a 6 frases. Pode usar lista se ajudar.",
+            "complexo": "Responda de forma completa. Use estrutura clara. Foque no que Arthur e você podem fazer juntos.",
+        }.get(complexidade, "Seja direto e adequado ao tema.")
+
+        prompt = (
+            f"{self.SYSTEM_CHAT}\n\n"
+            f"{contexto}"
+            f"INSTRUÇÃO DE TAMANHO: {instrucao_tamanho}\n\n"
+            f"Arthur: {pergunta}\nPacheco:"
+        )
+
+        resposta = self.cliente.gerar(prompt, temperatura=CONFIG["temperatura_chat"])
+
+        # Trunca se o modelo começar a inventar falas do Arthur
+        resposta = ModuloChat._truncar_delirio(resposta)
+
+        self.historico.append({"usuario": pergunta, "resposta": resposta.strip()})
+        if len(self.historico) > 12:
+            self.historico.pop(0)
+
+        return resposta.strip()
+
+    @staticmethod
+    def _truncar_delirio(texto: str) -> str:
+        """
+        Corta a resposta se o modelo começar a inventar falas do Arthur.
+        Detecta padrões como 'Arthur:', 'Você:', 'User:' surgindo no meio da resposta.
+        """
+        gatilhos = (
+            "\nArthur:", "\nVocê:", "\nUser:", "\nUsuário:",
+            "\nARTHUR:", "\nVOCÊ:", "\nUSER:",
+        )
+        pos_corte = len(texto)
+        for g in gatilhos:
+            idx = texto.find(g)
+            if idx != -1 and idx < pos_corte:
+                pos_corte = idx
+
+        return texto[:pos_corte].strip()
+
+
+# ══════════════════════════════════════════════════════════════
+#  SEGURANÇA — AST
+# ══════════════════════════════════════════════════════════════
+
+_CHAMADAS_BLOQUEADAS = frozenset({
+    "os.system", "os.popen", "os.remove", "os.rmdir", "os.unlink",
+    "shutil.rmtree", "shutil.move", "shutil.copy",
+    "subprocess.run", "subprocess.call", "subprocess.Popen", "subprocess.check_output",
+    "eval", "exec", "compile", "__import__",
+})
+
+_MODULOS_PERMITIDOS = frozenset({
+    "os", "json", "datetime", "re", "math", "random", "string",
+    "pathlib", "collections", "itertools", "functools", "time",
+})
+
+
+class AnalisadorSeguranca:
+
+    @staticmethod
+    def analisar(codigo: str) -> tuple[bool, str]:
+        try:
+            arvore = ast.parse(codigo)
+        except SyntaxError as e:
+            return False, f"Sintaxe inválida: {e}"
+
+        for no in ast.walk(arvore):
+            if isinstance(no, ast.Call):
+                nome = AnalisadorSeguranca._nome(no)
+                if nome and nome in _CHAMADAS_BLOQUEADAS:
+                    return False, f"Chamada bloqueada: '{nome}'"
+
+            if isinstance(no, (ast.Import, ast.ImportFrom)):
+                mods = (
+                    [a.name for a in no.names]
+                    if isinstance(no, ast.Import)
+                    else [no.module or ""]
+                )
+                for mod in mods:
+                    raiz = mod.split(".")[0]
+                    if raiz and raiz not in _MODULOS_PERMITIDOS:
+                        return False, f"Import não permitido: '{mod}'"
+
+        return True, "OK"
+
+    @staticmethod
+    def _nome(no: ast.Call) -> str | None:
+        if isinstance(no.func, ast.Attribute):
+            if isinstance(no.func.value, ast.Name):
+                return f"{no.func.value.id}.{no.func.attr}"
+        if isinstance(no.func, ast.Name):
+            return no.func.id
+        return None
+
+
+# ══════════════════════════════════════════════════════════════
+#  EXECUTOR
+# ══════════════════════════════════════════════════════════════
+
+class Executor:
+
+    def __init__(self, sandbox: str):
+        self.sandbox = Path(sandbox)
+
+    def executar(self, codigo: str) -> tuple[bool, str]:
+        seguro, motivo = AnalisadorSeguranca.analisar(codigo)
+        if not seguro:
+            return False, f"[BLOQUEADO] {motivo}"
+
+        nome = f"exec_{int(time.time() * 1000)}.py"
+        caminho = self.sandbox / nome
+        caminho.write_text(codigo, encoding="utf-8")
+
+        try:
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+            resultado = subprocess.run(
+                [sys.executable, "-X", "utf8", str(caminho)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=CONFIG["timeout_execucao"],
+                env=env,
+            )
+
+            stdout = Executor._limpar(resultado.stdout).strip()
+            stderr = Executor._limpar(resultado.stderr).strip()
+
+            if resultado.returncode != 0:
+                return False, stderr or stdout or "Erro desconhecido"
+
+            if not stdout:
+                return False, (
+                    "Código executou sem erros mas sem saída. "
+                    "Certifique-se de chamar print() com os resultados FORA de qualquer função."
+                )
+
+            return True, stdout
+
+        except subprocess.TimeoutExpired:
+            return False, f"Timeout: execução ultrapassou {CONFIG['timeout_execucao']}s."
+        except Exception as e:
+            return False, f"Erro ao executar: {e}"
+        finally:
+            try:
+                caminho.unlink()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _limpar(texto: str) -> str:
+        return "\n".join(
+            l for l in texto.splitlines()
+            if not any(r in l for r in RUIDO_DEBUGGER)
+        )
+
+
+# ══════════════════════════════════════════════════════════════
+#  MEMÓRIA
+# ══════════════════════════════════════════════════════════════
+
+class Memoria:
+
+    def __init__(self, caminho: str):
+        self.curto_prazo: list[dict] = []
+        self.arquivo = Path(caminho)
+        self.longo_prazo: list[dict] = self._carregar()
+
+    def _carregar(self) -> list:
+        if self.arquivo.exists():
+            try:
+                return json.loads(self.arquivo.read_text(encoding="utf-8"))
+            except Exception:
+                return []
+        return []
+
+    def _salvar(self):
+        dados = self.longo_prazo[-CONFIG["limite_memoria_longa"]:]
+        self.arquivo.write_text(
+            json.dumps(dados, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
+    def adicionar(self, usuario: str, codigo: str, sucesso: bool):
+        entrada = {
+            "ts":      datetime.now().isoformat(),
+            "usuario": usuario,
+            "codigo":  codigo,
+            "sucesso": sucesso,
+        }
+        self.curto_prazo.append(entrada)
+        if len(self.curto_prazo) > CONFIG["limite_memoria_curta"]:
+            self.curto_prazo.pop(0)
+
+        if sucesso and codigo.strip():
+            self.longo_prazo.append(entrada)
+            self._salvar()
+
+    def contexto_curto(self) -> str:
+        if not self.curto_prazo:
+            return "(sem histórico)"
+        linhas = []
+        for h in self.curto_prazo[-3:]:
+            status = "OK" if h["sucesso"] else "FALHOU"
+            linhas.append(f"[{status}] User: {h['usuario'][:120]}")
+        return "\n".join(linhas)
+
+    def buscar_similar(self, pergunta: str) -> str | None:
+        gatilhos = ("arquivo", "json", "estoque", "salvar", "ler", "leia",
+                    "venda", "produto", "relatorio", "relatório", "csv")
+        if not any(g in pergunta.lower() for g in gatilhos):
+            return None
+
+        palavras = set(pergunta.lower().split())
+        melhor_score = 0.0
+        melhor = None
+
+        for entrada in reversed(self.longo_prazo):
+            p2 = set(entrada["usuario"].lower().split())
+            if not p2:
+                continue
+            score = len(palavras & p2) / len(palavras | p2)
+            if score > melhor_score and score >= 0.45:
+                melhor_score = score
+                melhor = entrada.get("codigo") or entrada.get("codigo_gerado") or ""
+
+        return melhor
+
+
+# ══════════════════════════════════════════════════════════════
+#  PROMPTS (modo código)
+# ══════════════════════════════════════════════════════════════
+
+class PromptBuilder:
+
+    DIR_PROJETO: str = ""
+
+    @classmethod
+    def _base(cls) -> str:
+        return f"""\
+Você é o Pacheco AI, assistente de IA da LIMA CORP criado por Arthur Lima.
+Especialidade: Python, Gestão de Estoque, automações de negócio.
+
+REGRAS ABSOLUTAS — siga todas sem exceção:
+1. Responda APENAS com um único bloco ```python```. Nada de texto fora dele.
+2. O código deve rodar de forma 100% independente.
+3. SEMPRE use print() para mostrar resultados ao usuário.
+4. Se definir funções, OBRIGATORIAMENTE chame-as depois da definição:
+     def calcular(): return 42
+     print(calcular())   ← OBRIGATÓRIO
+5. Módulos permitidos: os, json, datetime, re, math, random, pathlib, collections, time.
+6. PROIBIDO: subprocess, requests, socket, eval, exec, __import__, shutil.
+7. Caminhos de arquivo: use sempre o caminho absoluto r"{cls.DIR_PROJETO}"
+   Exemplo: open(r"{cls.DIR_PROJETO}\\Sandbox\\estoque.json", encoding="utf-8")
+8. IDIOMA: português brasileiro. PROIBIDO espanhol:
+     ERRADO: productos, costo, precio, archivo, cantidad
+     CERTO:  produtos,  custo,  preco,  arquivo, quantidade
+9. Confira TODOS os nomes de variáveis. 'total_custo' e 'total_costo' são diferentes.
+10. NUNCA use Path(__file__) — o script roda em pasta temporária."""
+
+    @classmethod
+    def inicial(cls, pergunta: str, historico: str, similar: str | None) -> str:
+        partes = [cls._base(), f"\nHISTÓRICO:\n{historico}"]
+        if similar:
+            partes.append(f"\nREFERÊNCIA ANTERIOR:\n```python\n{similar}\n```")
+        partes.append(f"\nTAREFA: {pergunta}")
+        return "\n".join(partes)
+
+    @classmethod
+    def correcao(cls, pergunta: str, codigo: str, erro: str, tentativa: int) -> str:
+        return (
+            f"{cls._base()}\n\n"
+            f"TAREFA: {pergunta}\n\n"
+            f"TENTATIVA {tentativa} FALHOU COM ESTE ERRO:\n{erro}\n\n"
+            f"CÓDIGO PROBLEMÁTICO:\n```python\n{codigo}\n```\n\n"
+            f"CORRIJA agora. Lembre:\n"
+            f"- Diretório: r\"{cls.DIR_PROJETO}\"\n"
+            f"- print() FORA de funções\n"
+            f"- variáveis em português\n"
+            f"Responda SOMENTE com o ```python corrigido."
+        )
+
+
+# ══════════════════════════════════════════════════════════════
+#  CLIENTE OLLAMA
+# ══════════════════════════════════════════════════════════════
+
+class ClienteOllama:
+
+    def __init__(self):
+        self.session = requests.Session()
+
+    def verificar(self) -> bool:
+        try:
+            return self.session.get("http://localhost:11434", timeout=3).status_code == 200
+        except Exception:
+            return False
+
+    def gerar(self, prompt: str, temperatura: float | None = None) -> str:
+        if temperatura is None:
+            temperatura = CONFIG["temperatura_codigo"]
+
+        payload = {
+            "model":   CONFIG["modelo"],
+            "prompt":  prompt,
+            "stream":  True,
+            "options": {"temperature": temperatura},
+        }
+        resposta = ""
+        try:
+            with self.session.post(
+                CONFIG["url_ollama"],
+                json=payload,
+                stream=True,
+                timeout=CONFIG["timeout_resposta"],
+            ) as r:
+                r.raise_for_status()
+                for linha in r.iter_lines():
+                    if linha:
+                        token = json.loads(linha.decode()).get("response", "")
+                        print(token, end="", flush=True)
+                        resposta += token
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError("Ollama offline. Execute: ollama serve")
+        return resposta
+
+
+# ══════════════════════════════════════════════════════════════
+#  LOGGER
+# ══════════════════════════════════════════════════════════════
+
+class Logger:
+
+    def __init__(self, pasta: str):
+        nome = f"sessao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        self.arquivo = Path(pasta) / nome
+
+    def log(self, nivel: str, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        with open(self.arquivo, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] [{nivel}] {msg}\n")
+
+
+# ══════════════════════════════════════════════════════════════
+#  PACHECO AI — NÚCLEO v3.2
+# ══════════════════════════════════════════════════════════════
+
+class PachecoAI:
+
+    VERSAO = "3.2"
+
+    def __init__(self):
+        self._criar_dirs()
+        PromptBuilder.DIR_PROJETO = str(Path(__file__).parent.resolve())
+        self.memoria  = Memoria(os.path.join(DIRETORIOS["memoria"], "memoria_longa.json"))
+        self.executor = Executor(DIRETORIOS["sandbox"])
+        self.cliente  = ClienteOllama()
+        self.logger   = Logger(DIRETORIOS["logs"])
+        self.chat     = ModuloChat(self.cliente)
+        self.modo_atual: str = CONFIG["modo_padrao"]  # "chat" | "codigo" | "auto"
+
+    def _criar_dirs(self):
+        for p in DIRETORIOS.values():
+            os.makedirs(p, exist_ok=True)
+
+    # ── Gerenciador de modo ────────────────────────────────────
+    def _trocar_modo(self, novo_modo: str):
+        self.modo_atual = novo_modo
+        icone = ICONE_MODO.get(novo_modo, "")
+        nomes = {"chat": "CONVERSA", "codigo": "PROGRAMADOR", "auto": "AUTOMÁTICO"}
+        print(f"\n{icone} Modo {nomes[novo_modo]} ativado.", end="")
+        if novo_modo == "auto":
+            print(" (Pacheco decide o modo com base no que você digitar)")
+        elif novo_modo == "chat":
+            print(" (Use /cod pra programar)")
+        elif novo_modo == "codigo":
+            print(" (Use /chat pra conversar)")
+        print()
+
+    # ── Parser de entrada ──────────────────────────────────────
+    def _parsear_entrada(self, entrada: str) -> tuple[str, str]:
+        """
+        Retorna (acao, texto_limpo).
+        acao pode ser: 'chat', 'codigo', 'comando:<nome>', 'modo:<nome>'
+        """
+        t = entrada.strip()
+        t_lower = t.lower()
+
+        # Verifica comandos rápidos /prefixo
+        for prefixo, acao in _COMANDOS_RAPIDOS.items():
+            if t_lower == prefixo or t_lower.startswith(prefixo + " "):
+                texto_restante = t[len(prefixo):].strip()
+                return acao, texto_restante
+
+        # Sem prefixo: usa o modo atual ou auto-classifica
+        if self.modo_atual == "auto":
+            modo_inferido = Classificador.classificar(t)
+            return modo_inferido, t
+        else:
+            return self.modo_atual, t
+
+    # ── Roteador principal ────────────────────────────────────
+    def rotear(self, entrada: str) -> None:
+        acao, texto = self._parsear_entrada(entrada)
+
+        # Troca de modo
+        if acao.startswith("modo:"):
+            self._trocar_modo(acao.split(":")[1])
+            return
+
+        # Comandos instantâneos
+        if acao in ("hora", "data", "versao", "versão"):
+            self._cmd_rapido(acao)
+            return
+        if acao == "memoria" or acao == "memória":
+            self._cmd_memoria()
+            return
+        if acao == "config":
+            print(json.dumps(CONFIG, indent=2, ensure_ascii=False))
+            return
+        if acao == "sair":
+            raise SystemExit("sair")
+        if acao == "ajuda":
+            self._cmd_ajuda()
+            return
+
+        # Conversa
+        if acao == "chat":
+            complexidade = Classificador.estimar_complexidade(texto)
+            icone = ICONE_MODO["chat"]
+            print(f"\n{icone} [{complexidade}]\n")
+            self.chat.responder(texto, complexidade)
+            print()
+            self.logger.log("CHAT", texto[:100])
+            return
+
+        # Código
+        if acao == "codigo":
+            print(f"\n{ICONE_MODO['codigo']} [MODO PROGRAMADOR]\n")
+            self.processar(texto)
+            return
+
+    # ── Processador de código (lógica original) ───────────────
+    def processar(self, pergunta: str) -> dict:
+        resultado = {
+            "pergunta":   pergunta,
+            "codigo":     "",
+            "saida":      "",
+            "sucesso":    False,
+            "tentativas": 0,
+        }
+
+        similar = self.memoria.buscar_similar(pergunta)
+        if similar:
+            print("[Memória] Referência similar encontrada.\n")
+
+        codigo_atual = ""
+        erro_atual   = ""
+
+        for tentativa in range(1, CONFIG["max_tentativas"] + 1):
+            resultado["tentativas"] = tentativa
+
+            if tentativa == 1:
+                prompt = PromptBuilder.inicial(pergunta, self.memoria.contexto_curto(), similar)
+            else:
+                print(f"\n[Tentativa {tentativa}/{CONFIG['max_tentativas']}] Corrigindo...\n")
+                prompt = PromptBuilder.correcao(pergunta, codigo_atual, erro_atual, tentativa)
+
+            print(f"{'─'*55}")
+            resposta_capturada = self.cliente.gerar(prompt)
+            print()
+
+            blocos = REGEX_CODIGO.findall(resposta_capturada)
+
+            if not blocos:
+                erro_atual = "Nenhum bloco ```python``` na resposta."
+                print(f"[AVISO] {erro_atual}")
+                continue
+
+            codigo_atual = blocos[-1].strip()
+            resultado["codigo"] = codigo_atual
+
+            sucesso, saida = self.executor.executar(codigo_atual)
+            resultado["saida"]   = saida
+            resultado["sucesso"] = sucesso
+
+            print(f"\n{'─'*55}")
+            print(f"[{'✅ SUCESSO' if sucesso else '❌ FALHOU'}]\n{saida}")
+
+            if sucesso:
+                self.logger.log("SUCESSO", pergunta[:100])
+                break
+            else:
+                erro_atual = saida
+                self.logger.log("ERRO", f"T{tentativa}: {saida[:200]}")
+
+        self.memoria.adicionar(pergunta, codigo_atual, resultado["sucesso"])
+        return resultado
+
+    def _gerar_silencioso(self, prompt: str) -> str:
+        """Gera sem fazer stream (pra capturar o texto completo internamente)."""
+        payload = {
+            "model":   CONFIG["modelo"],
+            "prompt":  prompt,
+            "stream":  False,
+            "options": {"temperature": CONFIG["temperatura_codigo"]},
+        }
+        try:
+            r = self.cliente.session.post(
+                CONFIG["url_ollama"],
+                json=payload,
+                timeout=CONFIG["timeout_resposta"],
+            )
+            r.raise_for_status()
+            return r.json().get("response", "")
+        except Exception:
+            return ""
+
+    # ── Comandos rápidos ──────────────────────────────────────
+    def _cmd_rapido(self, tipo: str):
+        agora = datetime.now()
+        if tipo in ("hora",):
+            print(f"\nSão {agora.strftime('%H:%M')} ⏰")
+        elif tipo in ("data",):
+            dias   = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
+            meses  = ["janeiro","fevereiro","março","abril","maio","junho",
+                      "julho","agosto","setembro","outubro","novembro","dezembro"]
+            print(f"\nHoje é {dias[agora.weekday()]}, {agora.day} de {meses[agora.month-1]} de {agora.year} 📅")
+        elif tipo in ("versao", "versão"):
+            print(f"\nPacheco AI Ω v{self.VERSAO} | LIMA CORP — by Arthur Lima 🤖")
+
+    def _cmd_ajuda(self):
+        icone = ICONE_MODO.get(self.modo_atual, "")
+        modo_nome = {"chat": "CONVERSA", "codigo": "PROGRAMADOR", "auto": "AUTOMÁTICO"}.get(self.modo_atual, self.modo_atual)
+        print(f"""
+┌─ PACHECO AI Ω v{self.VERSAO} ─ AJUDA ──────────────────────┐
+│                                                       │
+│  MODO ATUAL: {icone} {modo_nome:<38}│
+│                                                       │
+│  TROCAR MODO:                                         │
+│    /chat  → Modo Conversa  (papo, ideias, análise)    │
+│    /cod   → Modo Programador (gera e roda Python)     │
+│    /auto  → Modo Automático (Pacheco decide)          │
+│                                                       │
+│  COMANDOS RÁPIDOS:                                    │
+│    /hora    → que horas são                           │
+│    /data    → data de hoje                            │
+│    /versao  → versão do sistema                       │
+│    /memoria → histórico da sessão                     │
+│    /config  → configurações atuais                    │
+│    /ajuda   → esta tela                               │
+│    /sair    → encerrar                                │
+│                                                       │
+│  DICA: Termine textos longos (multiparagrafo) com --- │
+└───────────────────────────────────────────────────────┘""")
+
+    def _cmd_memoria(self):
+        print("\n── SESSÃO ATUAL ──")
+        if not self.memoria.curto_prazo:
+            print("(vazia)")
+        else:
+            for i, h in enumerate(self.memoria.curto_prazo, 1):
+                ts = h["ts"][:19].replace("T", " ")
+                ok = "✅" if h["sucesso"] else "❌"
+                print(f"{i}. [{ts}] {ok} {h['usuario'][:65]}...")
+        print(f"\nMemória longa: {len(self.memoria.longo_prazo)} soluções persistidas")
+
+    # ── Loop principal ────────────────────────────────────────
+    def executar(self):
+        print("\n" + "═"*55)
+        print(f"  PACHECO AI Ω v{self.VERSAO} | LIMA CORP")
+        print(f"  by Arthur Lima")
+        print("═"*55)
+
+        if not self.cliente.verificar():
+            print("\nOllama offline! Execute: ollama serve")
+            print(f"Depois: ollama pull {CONFIG['modelo']}")
+            return
+
+        modo_nome = {"chat": "CONVERSA 💬", "codigo": "PROGRAMADOR ⌨️", "auto": "AUTOMÁTICO 🤖"}
+        print(f"\nOnline | Modelo: {CONFIG['modelo']}")
+        print(f"Memória longa: {len(self.memoria.longo_prazo)} soluções salvas")
+        print(f"Modo inicial: {modo_nome.get(self.modo_atual, self.modo_atual)}")
+        print(f"\n/chat → conversa | /cod → código | /auto → automático | /ajuda → ajuda\n")
+
+        while True:
+            try:
+                icone = ICONE_MODO.get(self.modo_atual, "")
+                print(f"\n{'─'*55}")
+                print(f"VOCÊ {icone}:")
+
+                linhas = []
+                while True:
+                    linha = input()
+                    if linha.strip() == "---":
+                        break
+                    if not linha.strip() and linhas:
+                        break
+                    if linha.strip():
+                        linhas.append(linha)
+                    if not linha.strip() and not linhas:
+                        continue
+
+                entrada = "\n".join(linhas).strip()
+                if not entrada:
+                    continue
+
+                self.rotear(entrada)
+
+            except SystemExit as e:
+                if str(e) == "sair":
+                    print(f"\nFalou, Arthur! Até mais. 👋")
+                break
+            except KeyboardInterrupt:
+                print("\n[Ctrl+C] Use /sair pra encerrar.")
+            except RuntimeError as e:
+                print(f"\nERRO: {e}")
+                break
+            except Exception as e:
+                import traceback
+                print(f"\n[ERRO INESPERADO] {e}")
+                print(traceback.format_exc())
+                self.logger.log("FATAL", traceback.format_exc())
+
+
+# ══════════════════════════════════════════════════════════════
+#  ENTRADA
+# ══════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    ai = PachecoAI()
+    ai.executar()
