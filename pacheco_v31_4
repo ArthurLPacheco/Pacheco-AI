@@ -1,0 +1,513 @@
+"""
+╔══════════════════════════════════════════════════════════════╗
+║            PACHECO AI Ω — v3.0 | LIMA CORP                  ║
+║       Sistema de IA Evolutivo — Base rumo ao Jarvis          ║
+╠══════════════════════════════════════════════════════════════╣
+║  Motor:      Ollama local (phi3:3.8b)                        ║
+║  Memória:    Curto prazo (RAM) + Longo prazo (JSON)          ║
+║  Segurança:  Análise AST pré-execução                        ║
+║  Retry:      Autocorreção com contexto de erro               ║
+║  Validação:  Checa saída vazia antes de salvar sucesso       ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+import ast
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import requests
+
+# ══════════════════════════════════════════════════════════════
+#  CONFIGURAÇÃO CENTRAL
+# ══════════════════════════════════════════════════════════════
+
+CONFIG = {
+    "modelo":                "qwen2.5-coder:7b",
+    "url_ollama":            "http://localhost:11434/api/generate",
+    "timeout_resposta":      300,
+    "timeout_execucao":      15,
+    "temperatura":           0.1,
+    "max_tentativas":        3,
+    "limite_memoria_curta":  5,
+    "limite_memoria_longa":  200,
+}
+
+DIRETORIOS = {
+    "sandbox":     "Sandbox",
+    "projetos":    "Projetos_Ativos",
+    "memoria":     "Memoria",
+    "logs":        "Logs",
+    "habilidades": "Habilidades",
+}
+
+REGEX_CODIGO = re.compile(r'```python\s*\n(.*?)\n\s*```', re.DOTALL)
+
+RUIDO_DEBUGGER = (
+    "Debugger warning", "frozen modules", "pydevd", "PYDEVD",
+    "0.00s -", "0.01s -", "0.02s -", "0.03s -",
+    "frozen_modules", "PYDEVD_DISABLE_FILE_VALIDATION",
+)
+
+# ══════════════════════════════════════════════════════════════
+#  SEGURANÇA — AST
+# ══════════════════════════════════════════════════════════════
+
+_CHAMADAS_BLOQUEADAS = frozenset({
+    "os.system", "os.popen", "os.remove", "os.rmdir", "os.unlink",
+    "shutil.rmtree", "shutil.move", "shutil.copy",
+    "subprocess.run", "subprocess.call", "subprocess.Popen", "subprocess.check_output",
+    "eval", "exec", "compile", "__import__",
+})
+
+_MODULOS_PERMITIDOS = frozenset({
+    "os", "json", "datetime", "re", "math", "random", "string",
+    "pathlib", "collections", "itertools", "functools", "time",
+})
+
+
+class AnalisadorSeguranca:
+
+    @staticmethod
+    def analisar(codigo: str) -> tuple[bool, str]:
+        try:
+            arvore = ast.parse(codigo)
+        except SyntaxError as e:
+            return False, f"Sintaxe inválida: {e}"
+
+        for no in ast.walk(arvore):
+            if isinstance(no, ast.Call):
+                nome = AnalisadorSeguranca._nome(no)
+                if nome and nome in _CHAMADAS_BLOQUEADAS:
+                    return False, f"Chamada bloqueada: '{nome}'"
+
+            if isinstance(no, (ast.Import, ast.ImportFrom)):
+                mods = (
+                    [a.name for a in no.names]
+                    if isinstance(no, ast.Import)
+                    else [no.module or ""]
+                )
+                for mod in mods:
+                    raiz = mod.split(".")[0]
+                    if raiz and raiz not in _MODULOS_PERMITIDOS:
+                        return False, f"Import não permitido: '{mod}'"
+
+        return True, "OK"
+
+    @staticmethod
+    def _nome(no: ast.Call) -> str | None:
+        if isinstance(no.func, ast.Attribute):
+            if isinstance(no.func.value, ast.Name):
+                return f"{no.func.value.id}.{no.func.attr}"
+        if isinstance(no.func, ast.Name):
+            return no.func.id
+        return None
+
+
+# ══════════════════════════════════════════════════════════════
+#  EXECUTOR
+# ══════════════════════════════════════════════════════════════
+
+class Executor:
+
+    def __init__(self, sandbox: str):
+        self.sandbox = Path(sandbox)
+
+    def executar(self, codigo: str) -> tuple[bool, str]:
+        seguro, motivo = AnalisadorSeguranca.analisar(codigo)
+        if not seguro:
+            return False, f"[BLOQUEADO] {motivo}"
+
+        nome = f"exec_{int(time.time() * 1000)}.py"
+        caminho = self.sandbox / nome
+        caminho.write_text(codigo, encoding="utf-8")
+
+        try:
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+            resultado = subprocess.run(
+                [sys.executable, "-X", "utf8", str(caminho)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=CONFIG["timeout_execucao"],
+                env=env,
+            )
+
+            stdout = Executor._limpar(resultado.stdout).strip()
+            stderr = Executor._limpar(resultado.stderr).strip()
+
+            if resultado.returncode != 0:
+                return False, stderr or stdout or "Erro desconhecido"
+
+            if not stdout:
+                return False, (
+                    "Código executou sem erros mas sem saída. "
+                    "Certifique-se de chamar print() com os resultados FORA de qualquer função."
+                )
+
+            return True, stdout
+
+        except subprocess.TimeoutExpired:
+            return False, f"Timeout: execução ultrapassou {CONFIG['timeout_execucao']}s."
+        except Exception as e:
+            return False, f"Erro ao executar: {e}"
+        finally:
+            try:
+                caminho.unlink()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _limpar(texto: str) -> str:
+        return "\n".join(
+            l for l in texto.splitlines()
+            if not any(r in l for r in RUIDO_DEBUGGER)
+        )
+
+
+# ══════════════════════════════════════════════════════════════
+#  MEMÓRIA
+# ══════════════════════════════════════════════════════════════
+
+class Memoria:
+
+    def __init__(self, caminho: str):
+        self.curto_prazo: list[dict] = []
+        self.arquivo = Path(caminho)
+        self.longo_prazo: list[dict] = self._carregar()
+
+    def _carregar(self) -> list:
+        if self.arquivo.exists():
+            try:
+                return json.loads(self.arquivo.read_text(encoding="utf-8"))
+            except Exception:
+                return []
+        return []
+
+    def _salvar(self):
+        dados = self.longo_prazo[-CONFIG["limite_memoria_longa"]:]
+        self.arquivo.write_text(
+            json.dumps(dados, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
+    def adicionar(self, usuario: str, codigo: str, sucesso: bool):
+        entrada = {
+            "ts": datetime.now().isoformat(),
+            "usuario": usuario,
+            "codigo": codigo,
+            "sucesso": sucesso,
+        }
+        self.curto_prazo.append(entrada)
+        if len(self.curto_prazo) > CONFIG["limite_memoria_curta"]:
+            self.curto_prazo.pop(0)
+
+        if sucesso and codigo.strip():
+            self.longo_prazo.append(entrada)
+            self._salvar()
+
+    def contexto_curto(self) -> str:
+        if not self.curto_prazo:
+            return "(sem histórico)"
+        linhas = []
+        for h in self.curto_prazo[-3:]:
+            status = "OK" if h["sucesso"] else "FALHOU"
+            linhas.append(f"[{status}] User: {h['usuario'][:120]}")
+        return "\n".join(linhas)
+
+    def buscar_similar(self, pergunta: str) -> str | None:
+        gatilhos = ("arquivo", "json", "estoque", "salvar", "ler", "leia",
+                    "venda", "produto", "relatorio", "relatório", "csv")
+        if not any(g in pergunta.lower() for g in gatilhos):
+            return None
+
+        palavras = set(pergunta.lower().split())
+        melhor_score = 0.0
+        melhor = None
+
+        for entrada in reversed(self.longo_prazo):
+            p2 = set(entrada["usuario"].lower().split())
+            if not p2:
+                continue
+            score = len(palavras & p2) / len(palavras | p2)
+            if score > melhor_score and score >= 0.45:
+                melhor_score = score
+                melhor = entrada.get("codigo") or entrada.get("codigo_gerado") or ""
+
+        return melhor
+
+
+# ══════════════════════════════════════════════════════════════
+#  PROMPTS
+# ══════════════════════════════════════════════════════════════
+
+class PromptBuilder:
+
+    DIR_PROJETO: str = ""
+
+    @classmethod
+    def _base(cls) -> str:
+        return f"""\
+Você é o Pacheco AI, assistente de IA da LIMA CORP criado por Arthur Lima.
+Especialidade: Python, Gestão de Estoque, automações de negócio.
+
+REGRAS ABSOLUTAS — siga todas sem exceção:
+1. Responda APENAS com um único bloco ```python```. Nada de texto fora dele.
+2. O código deve rodar de forma 100% independente.
+3. SEMPRE use print() para mostrar resultados ao usuário.
+4. Se definir funções, OBRIGATORIAMENTE chame-as depois da definição:
+     def calcular(): return 42
+     print(calcular())   ← OBRIGATÓRIO
+5. Módulos permitidos: os, json, datetime, re, math, random, pathlib, collections, time.
+6. PROIBIDO: subprocess, requests, socket, eval, exec, __import__, shutil.
+7. Caminhos de arquivo: use sempre o caminho absoluto r"{cls.DIR_PROJETO}"
+   Exemplo: open(r"{cls.DIR_PROJETO}\\Sandbox\\estoque.json", encoding="utf-8")
+8. IDIOMA: português brasileiro. PROIBIDO espanhol:
+     ERRADO: productos, costo, precio, archivo, cantidad, cesta
+     CERTO:  produtos,  custo,  preco,  arquivo, quantidade, cesta
+9. Confira TODOS os nomes de variáveis. 'total_custo' e 'total_costo' são diferentes.
+10. NUNCA use Path(__file__) — o script roda em pasta temporária."""
+
+    @classmethod
+    def inicial(cls, pergunta: str, historico: str, similar: str | None) -> str:
+        partes = [cls._base(), f"\nHISTÓRICO:\n{historico}"]
+        if similar:
+            partes.append(f"\nREFERÊNCIA ANTERIOR:\n```python\n{similar}\n```")
+        partes.append(f"\nTAREFA: {pergunta}")
+        return "\n".join(partes)
+
+    @classmethod
+    def correcao(cls, pergunta: str, codigo: str, erro: str, tentativa: int) -> str:
+        return (
+            f"{cls._base()}\n\n"
+            f"TAREFA: {pergunta}\n\n"
+            f"TENTATIVA {tentativa} FALHOU COM ESTE ERRO:\n{erro}\n\n"
+            f"CÓDIGO PROBLEMÁTICO:\n```python\n{codigo}\n```\n\n"
+            f"CORRIJA agora. Lembre:\n"
+            f"- Diretório: r\"{cls.DIR_PROJETO}\"\n"
+            f"- print() FORA de funções\n"
+            f"- variáveis em português\n"
+            f"Responda SOMENTE com o ```python corrigido."
+        )
+
+
+# ══════════════════════════════════════════════════════════════
+#  CLIENTE OLLAMA
+# ══════════════════════════════════════════════════════════════
+
+class ClienteOllama:
+
+    def __init__(self):
+        self.session = requests.Session()
+
+    def verificar(self) -> bool:
+        try:
+            return self.session.get("http://localhost:11434", timeout=3).status_code == 200
+        except Exception:
+            return False
+
+    def gerar(self, prompt: str) -> str:
+        payload = {
+            "model":   CONFIG["modelo"],
+            "prompt":  prompt,
+            "stream":  True,
+            "options": {"temperature": CONFIG["temperatura"]},
+        }
+        resposta = ""
+        try:
+            with self.session.post(
+                CONFIG["url_ollama"],
+                json=payload,
+                stream=True,
+                timeout=CONFIG["timeout_resposta"],
+            ) as r:
+                r.raise_for_status()
+                for linha in r.iter_lines():
+                    if linha:
+                        token = json.loads(linha.decode()).get("response", "")
+                        print(token, end="", flush=True)
+                        resposta += token
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError("Ollama offline. Execute: ollama serve")
+        return resposta
+
+
+# ══════════════════════════════════════════════════════════════
+#  LOGGER
+# ══════════════════════════════════════════════════════════════
+
+class Logger:
+
+    def __init__(self, pasta: str):
+        nome = f"sessao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        self.arquivo = Path(pasta) / nome
+
+    def log(self, nivel: str, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        with open(self.arquivo, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] [{nivel}] {msg}\n")
+
+
+# ══════════════════════════════════════════════════════════════
+#  PACHECO AI — NÚCLEO
+# ══════════════════════════════════════════════════════════════
+
+class PachecoAI:
+
+    VERSAO = "3.0"
+
+    def __init__(self):
+        self._criar_dirs()
+        PromptBuilder.DIR_PROJETO = str(Path(__file__).parent.resolve())
+        self.memoria  = Memoria(os.path.join(DIRETORIOS["memoria"], "memoria_longa.json"))
+        self.executor = Executor(DIRETORIOS["sandbox"])
+        self.cliente  = ClienteOllama()
+        self.logger   = Logger(DIRETORIOS["logs"])
+
+    def _criar_dirs(self):
+        for p in DIRETORIOS.values():
+            os.makedirs(p, exist_ok=True)
+
+    def processar(self, pergunta: str) -> dict:
+        resultado = {
+            "pergunta":   pergunta,
+            "codigo":     "",
+            "saida":      "",
+            "sucesso":    False,
+            "tentativas": 0,
+            "resposta":   "",
+        }
+
+        similar = self.memoria.buscar_similar(pergunta)
+        if similar:
+            print("\n[Memória] Referência similar encontrada.\n")
+
+        codigo_atual = ""
+        erro_atual   = ""
+
+        for tentativa in range(1, CONFIG["max_tentativas"] + 1):
+            resultado["tentativas"] = tentativa
+
+            if tentativa == 1:
+                prompt = PromptBuilder.inicial(pergunta, self.memoria.contexto_curto(), similar)
+            else:
+                print(f"\n[Tentativa {tentativa}/{CONFIG['max_tentativas']}] Corrigindo...\n")
+                prompt = PromptBuilder.correcao(pergunta, codigo_atual, erro_atual, tentativa)
+
+            print(f"\n{'─'*55}")
+            resposta = self.cliente.gerar(prompt)
+            print()
+
+            blocos = REGEX_CODIGO.findall(resposta)
+            if not blocos:
+                erro_atual = "Nenhum bloco ```python``` na resposta."
+                print(f"[AVISO] {erro_atual}")
+                continue
+
+            # Pega o último bloco — o modelo às vezes gera um rascunho antes do correto
+            codigo_atual = blocos[-1].strip()
+            resultado["codigo"] = codigo_atual
+
+            sucesso, saida = self.executor.executar(codigo_atual)
+            resultado["saida"]   = saida
+            resultado["sucesso"] = sucesso
+
+            print(f"\n{'─'*55}")
+            print(f"[{'SUCESSO' if sucesso else 'FALHOU'}]\n{saida}")
+
+            if sucesso:
+                self.logger.log("SUCESSO", pergunta[:100])
+                break
+            else:
+                erro_atual = saida
+                self.logger.log("ERRO", f"T{tentativa}: {saida[:200]}")
+
+        self.memoria.adicionar(pergunta, codigo_atual, resultado["sucesso"])
+        return resultado
+
+    def _safe_get_codigo(self, entrada: dict) -> str:
+        """Compatível com memória v2.0 e v3.0."""
+        return entrada.get("codigo") or entrada.get("codigo_gerado", "")
+
+    def executar(self):
+        print("\n" + "═"*55)
+        print(f"  PACHECO AI Ω v{self.VERSAO} | LIMA CORP")
+        print(f"  by Arthur Lima")
+        print("═"*55)
+
+        if not self.cliente.verificar():
+            print("\nOllama offline! Execute: ollama serve")
+            print(f"Depois: ollama pull {CONFIG['modelo']}")
+            return
+
+        print(f"\nOnline | Modelo: {CONFIG['modelo']}")
+        print(f"Memoria longa: {len(self.memoria.longo_prazo)} solucoes salvas")
+        print(f"Projeto: {PromptBuilder.DIR_PROJETO}")
+        print("\nComandos: 'memoria', 'config', 'sair'")
+        print("Termine comandos com '---'\n")
+
+        while True:
+            try:
+                print("\n" + "─"*55)
+                print("COMANDO (termine com '---'):")
+                linhas = []
+                while True:
+                    linha = input()
+                    if linha.strip() == "---":
+                        break
+                    linhas.append(linha)
+
+                entrada = "\n".join(linhas).strip()
+                if not entrada:
+                    continue
+
+                if entrada.lower() in ("sair", "exit", "quit"):
+                    print(f"\nAte mais, Arthur!")
+                    break
+                elif entrada.lower() == "memoria":
+                    self._cmd_memoria()
+                elif entrada.lower() == "config":
+                    print(json.dumps(CONFIG, indent=2, ensure_ascii=False))
+                else:
+                    self.processar(entrada)
+
+            except KeyboardInterrupt:
+                print("\n[Ctrl+C] Use 'sair' para encerrar.")
+            except RuntimeError as e:
+                print(f"\nERRO: {e}")
+                break
+            except Exception as e:
+                import traceback
+                print(f"\n[ERRO INESPERADO] {e}")
+                print(traceback.format_exc())
+                self.logger.log("FATAL", traceback.format_exc())
+
+    def _cmd_memoria(self):
+        print("\n── SESSAO ATUAL ──")
+        if not self.memoria.curto_prazo:
+            print("(vazia)")
+        else:
+            for i, h in enumerate(self.memoria.curto_prazo, 1):
+                ts = h["ts"][:19].replace("T", " ")
+                ok = "OK" if h["sucesso"] else "FALHOU"
+                print(f"{i}. [{ts}] [{ok}] {h['usuario'][:65]}...")
+        print(f"\nMemoria longa: {len(self.memoria.longo_prazo)} solucoes persistidas")
+
+
+# ══════════════════════════════════════════════════════════════
+#  ENTRADA
+# ══════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    ai = PachecoAI()
+    ai.executar()
