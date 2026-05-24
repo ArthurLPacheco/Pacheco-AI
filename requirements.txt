@@ -1,25 +1,60 @@
+# ==============================================================================
+# PACHECO AI - DEPENDENCIES (v1.0.0 ALPHA)
+# Core Framework, UI, Security, Data Analysis, and Automation Ecosystem
+# ==============================================================================
+
+# --- UI & Interface Engine ---
+PyQt6==6.6.1
+PyQt6-WebEngine==6.6.0
+
+# --- Core API & Networking ---
 requests
-pandas
-numpy
-openpyxl
-reportlab
-matplotlib
-pillow
+httpx
+beautifulsoup4
+lxml
 flask
 fastapi
 uvicorn
+
+# --- Data Science & Analytics ---
+pandas
+numpy
+matplotlib
+
+# --- Office Automation & File Generation ---
+Pillow
+openpyxl
+reportlab
+xlrd
+xlwt
+python-docx
+python-pptx
+
+# --- Security & Crypto ---
+cryptography
+PyJWT
+
+# --- System, UI CLI & Utility ---
 tqdm
 rich
 click
 pydantic
 python-dotenv
-pyyaml
+PyYAML
+toml
 arrow
-colorama
+python-dateutil
+pytz
+humanize
 tabulate
-cryptography
+colorama
+schedule
+
+# --- Notifications & Communication ---
+python-telegram-bot
+twilio
+yagmail
+
+# --- Asset Generation ---
 qrcode
 python-barcode
-httpx
-beautifulsoup4
-lxml
