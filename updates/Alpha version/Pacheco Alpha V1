@@ -1,0 +1,1178 @@
+"""
+╔══════════════════════════════════════════════════════════════╗
+║            PACHECO AI Ω — v5.4 FINAL | LIMA CORP            ║
+╠══════════════════════════════════════════════════════════════╣
+║  Motor Chat:   llama3.2:3b  (conversa, estratégia)          ║
+║  Motor Código: qwen2.5-coder:7b  (geração + execução)       ║
+║  Sessões:    SQLite persistente (pacheco.db)                ║
+║  Memória:    RAM + SQLite                                    ║
+║  Segurança:  AST pré-execução + módulos expandidos          ║
+║  Retry:      Até 3 tentativas com contexto de erro          ║
+║  v5.4: Correção de sintaxe, ordem de histórico, modo        ║
+║         silencioso, ancoragem absoluta mantida              ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+import ast, hashlib, json, os, re, sqlite3, subprocess, sys, time, webbrowser
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import requests
+
+# ══════════════════════════════════════════════════════════════
+#  ANCORAGEM ABSOLUTA DO PROJETO (FIX v5.3 / mantida na v5.4)
+# ══════════════════════════════════════════════════════════════
+PASTA_RAIZ = Path(__file__).parent.resolve()
+
+CONFIG = {
+    "modelo":                 "qwen2.5-coder:7b",
+    "modelo_chat":            "llama3.2:3b",
+    "url_ollama":             "http://localhost:11434/api/generate",
+    "timeout_resposta":       300,
+    "timeout_execucao":       30,
+    "temperatura_codigo":     0.1,
+    "temperatura_chat":       0.45,
+    "max_tentativas":         3,
+    "limite_memoria_curta":   5,
+    "limite_memoria_longa":   200,
+    "modo_padrao":            "chat",
+    "versao":                 "5.4",
+    "max_historico_sessao":   20,
+    "cache_ttl_segundos":     3600,
+    "chrome_path":            "",
+}
+
+DIRETORIOS = {
+    "sandbox":     str(PASTA_RAIZ / "Sandbox"),
+    "projetos":    str(PASTA_RAIZ / "Projetos_Ativos"),
+    "memoria":     str(PASTA_RAIZ / "Memoria"),
+    "logs":        str(PASTA_RAIZ / "Logs"),
+    "habilidades": str(PASTA_RAIZ / "Habilidades"),
+}
+
+DB_PATH = str(PASTA_RAIZ / "Memoria" / "pacheco.db")
+
+REGEX_CODIGO = re.compile(r'```python\s*(.*?)\s*```', re.DOTALL | re.IGNORECASE)
+
+RUIDO_DEBUGGER = (
+    "Debugger warning", "frozen modules", "pydevd", "PYDEVD",
+    "0.00s -", "0.01s -", "0.02s -", "0.03s -",
+    "frozen_modules", "PYDEVD_DISABLE_FILE_VALIDATION",
+)
+
+ICONE_MODO = {"chat": "💬", "codigo": "⌨️", "auto": "🤖"}
+
+# ══════════════════════════════════════════════════════════════
+#  MÓDULOS PERMITIDOS
+# ══════════════════════════════════════════════════════════════
+
+MODULOS_EXTERNOS: dict[str, str] = {
+    "pandas": "pandas", "numpy": "numpy", "matplotlib": "matplotlib",
+    "seaborn": "seaborn", "plotly": "plotly", "scipy": "scipy",
+    "sklearn": "scikit-learn", "statsmodels": "statsmodels",
+    "openpyxl": "openpyxl", "xlrd": "xlrd", "xlwt": "xlwt",
+    "xlsxwriter": "XlsxWriter", "docx": "python-docx", "pptx": "python-pptx",
+    "reportlab": "reportlab", "PyPDF2": "PyPDF2", "pdfplumber": "pdfplumber",
+    "fitz": "PyMuPDF", "pypdf": "pypdf",
+    "PIL": "pillow", "cv2": "opencv-python", "skimage": "scikit-image",
+    "requests": "requests", "httpx": "httpx", "aiohttp": "aiohttp",
+    "bs4": "beautifulsoup4", "lxml": "lxml", "selenium": "selenium",
+    "playwright": "playwright", "scrapy": "scrapy",
+    "flask": "flask", "fastapi": "fastapi", "uvicorn": "uvicorn",
+    "django": "django", "starlette": "starlette",
+    "sqlalchemy": "SQLAlchemy", "pymongo": "pymongo", "redis": "redis",
+    "psycopg2": "psycopg2-binary", "pymysql": "PyMySQL", "peewee": "peewee",
+    "pyautogui": "pyautogui", "keyboard": "keyboard", "mouse": "mouse",
+    "pyperclip": "pyperclip", "pynput": "pynput", "schedule": "schedule",
+    "watchdog": "watchdog", "paramiko": "paramiko", "fabric": "fabric",
+    "telegram": "python-telegram-bot", "twilio": "twilio",
+    "yagmail": "yagmail", "sendgrid": "sendgrid", "smtplib": "smtplib",
+    "tqdm": "tqdm", "rich": "rich", "click": "click", "typer": "typer",
+    "pydantic": "pydantic", "dotenv": "python-dotenv", "yaml": "PyYAML",
+    "toml": "toml", "arrow": "arrow", "dateutil": "python-dateutil",
+    "pytz": "pytz", "humanize": "humanize", "tabulate": "tabulate",
+    "colorama": "colorama", "loguru": "loguru", "tenacity": "tenacity",
+    "cachetools": "cachetools", "more_itertools": "more-itertools",
+    "cryptography": "cryptography", "jwt": "PyJWT", "bcrypt": "bcrypt",
+    "passlib": "passlib", "qrcode": "qrcode", "barcode": "python-barcode",
+    "py7zr": "py7zr", "rarfile": "rarfile", "jinja2": "Jinja2",
+    "markdown": "Markdown", "pdfkit": "pdfkit",
+    "pywin32": "pywin32", "win32api": "pywin32", "win32con": "pywin32",
+    "psutil": "psutil", "GPUtil": "gputil", "pygetwindow": "PyGetWindow",
+    "pyscreeze": "pyscreeze", "pytesseract": "pytesseract",
+    "nmap": "python-nmap", "ping3": "ping3", "speedtest": "speedtest-cli",
+}
+
+_STDLIB = frozenset({
+    "os", "sys", "io", "re", "math", "random", "string", "copy",
+    "json", "csv", "pathlib", "glob", "tempfile", "zipfile", "tarfile",
+    "datetime", "calendar", "time", "timeit", "threading", "queue",
+    "collections", "itertools", "functools", "heapq", "bisect",
+    "typing", "dataclasses", "enum", "abc", "contextlib",
+    "hashlib", "base64", "uuid", "decimal", "fractions", "statistics",
+    "unicodedata", "textwrap", "pprint", "struct", "array",
+    "logging", "warnings", "traceback", "gc", "platform", "inspect",
+    "configparser", "argparse", "shlex", "shutil",
+    "sqlite3", "tkinter", "ftplib",
+    "smtplib", "email", "html", "urllib", "http",
+    "socket", "ssl", "unittest", "locale", "weakref",
+    "pickle", "shelve", "dbm", "gzip", "bz2", "lzma",
+    "subprocess", "signal", "atexit", "errno",
+    "xml", "xmlrpc", "imaplib", "poplib",
+    "ast", "dis", "token", "tokenize", "keyword",
+    "concurrent", "asyncio", "multiprocessing", "ctypes", "mmap",
+    "webbrowser", "winreg",
+})
+
+_MODULOS_PERMITIDOS: frozenset[str] = _STDLIB | frozenset(MODULOS_EXTERNOS.keys())
+
+_CHAMADAS_BLOQUEADAS = frozenset({
+    "os.system", "os.popen",
+    "subprocess.run", "subprocess.call", "subprocess.Popen",
+    "subprocess.check_output", "eval", "exec", "compile", "__import__",
+})
+
+
+# ══════════════════════════════════════════════════════════════
+#  BANCO DE DADOS SQLite
+# ══════════════════════════════════════════════════════════════
+
+class BancoDados:
+
+    def __init__(self, caminho: str = DB_PATH):
+        Path(caminho).parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(caminho, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._criar_tabelas()
+
+    def _criar_tabelas(self):
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS sessoes (
+                id         TEXT PRIMARY KEY,
+                nome       TEXT NOT NULL DEFAULT 'Nova conversa',
+                modo       TEXT NOT NULL DEFAULT 'chat',
+                criada     TEXT NOT NULL,
+                atualizada TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mensagens (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                sessao_id TEXT NOT NULL,
+                role      TEXT NOT NULL,
+                texto     TEXT NOT NULL,
+                ts        TEXT NOT NULL,
+                FOREIGN KEY(sessao_id) REFERENCES sessoes(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS memoria_longa (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts      TEXT NOT NULL,
+                usuario TEXT NOT NULL,
+                codigo  TEXT,
+                sucesso INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_msgs_sessao ON mensagens(sessao_id);
+            PRAGMA foreign_keys = ON;
+        """)
+        self.conn.commit()
+
+    def criar_sessao(self, sessao_id: str, modo: str = "chat") -> None:
+        now = datetime.now().isoformat()
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sessoes(id,nome,modo,criada,atualizada) VALUES(?,?,?,?,?)",
+            (sessao_id, "Nova conversa", modo, now, now)
+        )
+        self.conn.commit()
+
+    def renomear_sessao(self, sessao_id: str, novo_nome: str) -> None:
+        self.conn.execute(
+            "UPDATE sessoes SET nome=?, atualizada=? WHERE id=?",
+            (novo_nome.strip()[:80], datetime.now().isoformat(), sessao_id)
+        )
+        self.conn.commit()
+
+    def deletar_sessao(self, sessao_id: str) -> None:
+        self.conn.execute("DELETE FROM sessoes WHERE id=?", (sessao_id,))
+        self.conn.commit()
+
+    def listar_sessoes(self) -> list[dict]:
+        cur = self.conn.execute("""
+            SELECT s.id, s.nome, s.modo, s.criada, s.atualizada,
+                   COUNT(m.id) as total
+            FROM sessoes s
+            LEFT JOIN mensagens m ON m.sessao_id = s.id
+            GROUP BY s.id
+            ORDER BY s.atualizada DESC
+        """)
+        return [dict(r) for r in cur.fetchall()]
+
+    def atualizar_modo_sessao(self, sessao_id: str, modo: str) -> None:
+        self.conn.execute(
+            "UPDATE sessoes SET modo=?, atualizada=? WHERE id=?",
+            (modo, datetime.now().isoformat(), sessao_id)
+        )
+        self.conn.commit()
+
+    def obter_sessao(self, sessao_id: str) -> Optional[dict]:
+        cur = self.conn.execute("SELECT * FROM sessoes WHERE id=?", (sessao_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def adicionar_mensagem(self, sessao_id: str, role: str, texto: str) -> None:
+        now = datetime.now().isoformat()
+        self.conn.execute(
+            "INSERT INTO mensagens(sessao_id,role,texto,ts) VALUES(?,?,?,?)",
+            (sessao_id, role, texto, now)
+        )
+        self.conn.execute(
+            "UPDATE sessoes SET atualizada=? WHERE id=?", (now, sessao_id)
+        )
+        self.conn.commit()
+
+    def obter_mensagens(self, sessao_id: str, limite: int = 200) -> list[dict]:
+        # CORREÇÃO v5.4: Subquery para retornar na ordem cronológica ASC
+        cur = self.conn.execute("""
+            SELECT role, texto, ts FROM (
+                SELECT id, role, texto, ts FROM mensagens 
+                WHERE sessao_id=? 
+                ORDER BY id DESC LIMIT ?
+            ) ORDER BY id ASC
+        """, (sessao_id, limite))
+        return [dict(r) for r in cur.fetchall()]
+
+    def salvar_memoria(self, usuario: str, codigo: str, sucesso: bool) -> None:
+        self.conn.execute(
+            "INSERT INTO memoria_longa(ts,usuario,codigo,sucesso) VALUES(?,?,?,?)",
+            (datetime.now().isoformat(), usuario, codigo, int(sucesso))
+        )
+        self.conn.commit()
+
+    def buscar_memoria_similar(self, pergunta: str) -> Optional[str]:
+        gatilhos = ("arquivo", "json", "estoque", "salvar", "ler", "leia", "venda", "produto",
+                    "relatorio", "relatório", "csv", "docx", "pptx", "excel", "planilha",
+                    "documento", "telegram", "email", "twilio")
+        if not any(g in pergunta.lower() for g in gatilhos):
+            return None
+        cur = self.conn.execute(
+            "SELECT usuario,codigo FROM memoria_longa WHERE sucesso=1 ORDER BY id DESC LIMIT 50"
+        )
+        palavras = set(pergunta.lower().split())
+        best_s, best = 0.0, None
+        for row in cur.fetchall():
+            p2 = set(row["usuario"].lower().split())
+            if not p2:
+                continue
+            s = len(palavras & p2) / len(palavras | p2)
+            if s > best_s and s >= 0.45:
+                best_s, best = s, row["codigo"]
+        return best
+
+    def contar_memorias(self) -> int:
+        cur = self.conn.execute("SELECT COUNT(*) FROM memoria_longa WHERE sucesso=1")
+        return cur.fetchone()[0]
+
+    def fechar(self):
+        self.conn.close()
+
+
+# ══════════════════════════════════════════════════════════════
+#  SESSÃO — cache de nome + triggers de renomeio (mantido v5.2)
+# ══════════════════════════════════════════════════════════════
+
+class Sessao:
+    def __init__(self, db: BancoDados, sessao_id: Optional[str] = None):
+        self.db   = db
+        self.id   = sessao_id or f"sess_{int(time.time()*1000)}"
+        self.modo = CONFIG["modo_padrao"]
+        self._dados: Optional[dict] = None
+        self._nome_cache: Optional[str] = None
+
+        if not sessao_id:
+            db.criar_sessao(self.id, self.modo)
+
+    def _carregar(self):
+        if self._dados is None:
+            self._dados = self.db.obter_sessao(self.id) or {}
+            self.modo = self._dados.get("modo", CONFIG["modo_padrao"])
+
+    @property
+    def nome(self) -> str:
+        if self._nome_cache is not None:
+            return self._nome_cache
+        self._carregar()
+        return self._dados.get("nome", "Nova conversa")
+
+    @nome.setter
+    def nome(self, valor: str):
+        valor = valor.strip()[:80]
+        self._nome_cache = valor
+        if self._dados is not None:
+            self._dados["nome"] = valor
+        self.db.renomear_sessao(self.id, valor)
+
+    def adicionar_msg(self, role: str, texto: str):
+        self.db.adicionar_mensagem(self.id, role, texto)
+
+    def msgs(self, limite: int = 200) -> list[dict]:
+        return self.db.obter_mensagens(self.id, limite)
+
+    def set_modo(self, modo: str):
+        self.modo = modo
+        self.db.atualizar_modo_sessao(self.id, modo)
+
+
+# ══════════════════════════════════════════════════════════════
+#  CLASSIFICADOR (mantido)
+# ══════════════════════════════════════════════════════════════
+
+_GATILHOS_CODIGO_FORTE = (
+    "crie um código", "cria um código", "crie um script", "cria um script",
+    "escreve um código", "escreva um código", "programa pra mim", "programa isso",
+    "implemente", "implementa", "faça um programa", "faz um programa",
+    "automatize", "automatiza", "gere um relatório", "gera um relatório",
+    "crie uma função", "cria uma função", "escreve uma função",
+    "monte um sistema", "monta um sistema", "crie um sistema", "cria um sistema",
+    "corrija o código", "corrige o código", "refatore", "refatora",
+    "otimize o código", "otimiza o código", "gera um documento", "crie um documento",
+    "faz uma planilha", "cria uma planilha", "gera uma planilha",
+    "faz um relatório", "cria um relatório", "manda mensagem", "envia mensagem",
+    "manda email", "envia email", "manda no telegram", "envia pro telegram",
+)
+
+_GATILHOS_CODIGO_FRACO = (
+    "código", "codigo", "script", "função", "funcao",
+    "calcule", "calcula", "salvar arquivo", "ler arquivo",
+    "leia o arquivo", "abra o arquivo", "leia arquivo", "abrir arquivo",
+    "estoque", "inventario", "inventário", "planilha",
+    "banco de dados", "sistema de", "relatório", "relatorio",
+    "documento", "docx", "pptx", "excel", "pdf", "selenium", "scraping", "automatizar",
+    "telegram", "twilio", "yagmail", "email", "notificação",
+)
+
+_GATILHOS_CONVERSA = (
+    "oi", "olá", "ola", "eai", "e aí", "e ai", "fala",
+    "bom dia", "boa tarde", "boa noite", "boa nite",
+    "tudo bem", "tudo bom", "tudo certo", "como vai", "como vc tá",
+    "como você está", "quem é você", "me conta", "me fala",
+    "o que você acha", "o que vc acha", "qual sua opinião", "qual sua opiniao",
+    "me explica", "você pode", "vc pode", "o que é", "o que sao", "o que são",
+    "como funciona", "por que", "porque", "qual é", "qual e",
+    "me diga", "você conhece", "vc conhece", "posso", "poderia",
+    "me recomenda", "me sugere", "me indica", "ideias", "sugestões",
+    "sugestoes", "dicas", "conversar", "falar sobre", "saber sobre",
+    "o que acha", "o que você pensa", "sua opinião", "me ajuda a pensar",
+    "vamos conversar", "preciso de conselho", "o que seria melhor",
+    "vale a pena", "você acredita", "o que você faria",
+    "como você se sente", "você tem", "você sabe", "sabia que",
+    "quero entender", "me explique", "curioso", "curiosidade",
+    "vender", "negócio", "negocio", "mercado", "produto virtual",
+    "produtos digitais", "ideia de negócio", "ideia de negocio",
+)
+
+_COMANDOS_RAPIDOS = {
+    "/hora": "hora", "/data": "data", "/versao": "versao", "/versão": "versao",
+    "/memoria": "memoria", "/memória": "memoria", "/config": "config",
+    "/modulos": "modulos", "/módulos": "modulos",
+    "/limpar": "limpar",
+    "/sair": "sair", "/cod": "modo:codigo", "/chat": "modo:chat", "/auto": "modo:auto",
+    "/ajuda": "ajuda", "/help": "ajuda",
+    "/abrir": "abrir",
+    "/renomear": "renomear", "/apagar": "apagar", "/sessoes": "sessoes", "/listar": "sessoes",
+}
+
+
+class Classificador:
+    @staticmethod
+    def classificar(texto: str) -> str:
+        t = texto.lower().strip()
+        if any(g in t for g in _GATILHOS_CODIGO_FORTE):
+            return "codigo"
+        sc = sum(1 for g in _GATILHOS_CODIGO_FRACO if g in t)
+        sv = sum(1 for g in _GATILHOS_CONVERSA if g in t)
+        if sc > sv + 1:  return "codigo"
+        if sv > 0:       return "chat"
+        if sc > 0:       return "codigo"
+        return "chat"
+
+    @staticmethod
+    def estimar_complexidade(texto: str) -> str:
+        t, w = texto.lower(), len(texto.split())
+        gatilhos = (
+            "quais são", "quais sao", "me lista", "me explica detalhado",
+            "quais as vantagens", "quais os", "como posso", "como eu posso",
+            "estratégia", "estrategia", "comparação", "diferença entre",
+            "me dê exemplos", "ideia de negócio", "produtos que", "o que seria",
+        )
+        if any(g in t for g in gatilhos) or w > 15: return "complexo"
+        if w <= 5:  return "simples"
+        return "medio"
+
+
+# ══════════════════════════════════════════════════════════════
+#  CACHE DE RESPOSTAS (mantido)
+# ══════════════════════════════════════════════════════════════
+
+class CacheRespostas:
+    def __init__(self, ttl: int = CONFIG["cache_ttl_segundos"]):
+        self._cache: dict[str, tuple[str, float]] = {}
+        self.ttl = ttl
+
+    @staticmethod
+    def _chave(texto: str) -> str:
+        return hashlib.md5(texto.strip().lower().encode()).hexdigest()
+
+    def get(self, texto: str) -> Optional[str]:
+        chave = self._chave(texto)
+        if chave in self._cache:
+            resposta, ts = self._cache[chave]
+            if time.time() - ts < self.ttl:
+                return resposta
+            del self._cache[chave]
+        return None
+
+    def set(self, texto: str, resposta: str):
+        self._cache[self._chave(texto)] = (resposta, time.time())
+
+    def limpar(self):
+        self._cache.clear()
+
+
+# ══════════════════════════════════════════════════════════════
+#  CONTROLE DO NAVEGADOR (mantido)
+# ══════════════════════════════════════════════════════════════
+
+class ControladorNavegador:
+
+    CHROME_PATHS = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Users\{user}\AppData\Local\Google\Chrome\Application\chrome.exe",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium-browser",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ]
+
+    @classmethod
+    def _encontrar_chrome(cls) -> str:
+        if CONFIG.get("chrome_path") and Path(CONFIG["chrome_path"]).exists():
+            return CONFIG["chrome_path"]
+        user = os.environ.get("USERNAME", os.environ.get("USER", ""))
+        for p in cls.CHROME_PATHS:
+            caminho = p.format(user=user)
+            if Path(caminho).exists():
+                CONFIG["chrome_path"] = caminho
+                return caminho
+        return ""
+
+    @classmethod
+    def abrir(cls, url: str) -> str:
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        chrome = cls._encontrar_chrome()
+        try:
+            if chrome:
+                subprocess.Popen([chrome, url])
+                return f"✅ Aberto no Chrome: {url}"
+            else:
+                webbrowser.open(url)
+                return f"✅ Aberto no navegador padrão: {url}"
+        except Exception as e:
+            return f"❌ Erro ao abrir: {e}"
+
+
+# ══════════════════════════════════════════════════════════════
+#  MÓDULO DE CONVERSAÇÃO (mantido, apenas versão 5.4)
+# ══════════════════════════════════════════════════════════════
+
+class ModuloChat:
+
+    SYSTEM_CHAT = """\
+Você é o Pacheco AI Ω, criado por Arthur Lima — dono da LIMA CORP.
+Você é a IA pessoal do Arthur, não um assistente genérico.
+
+══ REGRA DE OURO ══
+Você SÓ sabe sobre o Arthur o que está escrito aqui.
+Se Arthur mencionar algo pessoal que NÃO está aqui, diga que não sabe e pergunte.
+NUNCA invente, complete ou suponha detalhes pessoais.
+Quando não souber → diga "não sei, me conta."
+══════════════════
+
+IDENTIDADE: Pacheco AI Ω | Arthur Lima | LIMA CORP | v5.4
+
+SOBRE O ARTHUR (só isso, nada mais):
+- Está construindo setup tecnológico com você como base central
+- PC: GTX 1650, 8GB RAM, Ryzen 3 — roda bem, otimize pra isso
+- Quer vender produtos digitais: sites, apps, automações, cursos, SaaS
+- Arthur conduz o negócio; você programa e pensa estrategicamente junto
+- Módulos instalados: pandas, numpy, matplotlib, PIL, requests, httpx,
+  bs4, lxml, flask, fastapi, uvicorn, openpyxl, reportlab, xlrd, xlwt,
+  tqdm, rich, click, pydantic, dotenv, yaml, toml, arrow, dateutil,
+  pytz, humanize, tabulate, colorama, cryptography, jwt, qrcode, barcode,
+  docx, pptx, schedule, python-telegram-bot, twilio, yagmail
+
+SUAS ESPECIALIDADES:
+- Python, automação, Office (Word/PowerPoint/Excel), PDFs, web scraping
+- Banco de dados SQLite/PostgreSQL, análise de dados, sistemas de gestão
+- Mensagens via Telegram, Email (yagmail), SMS (Twilio)
+- Estratégia de negócios digitais executável pelos dois
+
+REGRAS DE RESPOSTA:
+- Português brasileiro informal. Direto ao ponto. Sem introduções.
+- NUNCA comece com "Tudo ótimo!", "Claro!", "Com certeza!".
+- Pergunta simples → 1-2 frases. Análise/estratégia → completo e estruturado.
+- Personalidade: direto, confiante, informal, inteligente. Nunca robótico.
+
+REGRA ANTI-CÓDIGO — NUNCA IGNORE:
+Modo CONVERSA = PROIBIDO gerar código em qualquer linguagem.
+PROIBIDO: blocos ```python```, ```js```, ```bash``` ou qualquer código.
+Se pedirem código → explique O QUE faria e mande pro /cod. Nunca escreva.
+
+REGRA ANTI-DELÍRIO:
+Responda UMA VEZ e PARE. Nunca simule falas do Arthur.
+NUNCA escreva "Arthur: ..." or "Você: ...". Proibido."""
+
+    def __init__(self, cliente: "ClienteOllama"):
+        self.cliente  = cliente
+        self.historico: list[dict] = []
+        self.cache    = CacheRespostas()
+
+    def gerar_nome(self, msg: str) -> str:
+        prompt = (
+            "Título curto (máx 5 palavras, sem aspas, sem ponto) para conversa:\n"
+            f'"{msg[:200]}"\nResposta APENAS com o título.'
+        )
+        try:
+            n = self.cliente.gerar(prompt, temperatura=0.3,
+                                   modelo=CONFIG["modelo_chat"], silencioso=True).strip()
+            n = re.sub(r'^["\']|["\']$', '', n).strip(" .")
+            return n[:60] if n else "Nova conversa"
+        except:
+            return "Nova conversa"
+
+    def responder(self, pergunta: str, complexidade: str,
+                  historico_sessao: Optional[list[dict]] = None) -> str:
+        cache_key = f"{complexidade}:{pergunta}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            print(cached, end="", flush=True)
+            return cached
+
+        trocas = self._comprimir_historico(historico_sessao or self.historico)
+
+        ctx = ""
+        if trocas:
+            ctx = "HISTÓRICO RECENTE:\n"
+            for t in trocas:
+                role = "Arthur" if t.get("role") == "user" else "Pacheco"
+                ctx += f"{role}: {t.get('texto', '')[:180]}\n"
+            ctx += "\n"
+
+        inst = {
+            "simples":  "1-2 frases, sem listas.",
+            "medio":    "3-6 frases, pode usar lista se ajudar.",
+            "complexo": "Seja completo. Use estrutura clara com tópicos.",
+        }.get(complexidade, "Direto ao ponto.")
+
+        prompt = (
+            f"{self.SYSTEM_CHAT}\n\n{ctx}"
+            f"TAMANHO: {inst}\n\n"
+            f"Arthur: {pergunta}\nPacheco:"
+        )
+
+        resp = self.cliente.gerar(prompt, temperatura=CONFIG["temperatura_chat"],
+                                  modelo=CONFIG["modelo_chat"])
+        resp = self._truncar_delirio(resp)
+        resp = self._remover_codigo(resp)
+        resp = resp.strip()
+
+        if complexidade in ("simples", "medio") and len(resp) < 800:
+            self.cache.set(cache_key, resp)
+
+        self.historico.append({"role": "user", "texto": pergunta})
+        self.historico.append({"role": "ai", "texto": resp})
+        if len(self.historico) > 24:
+            self.historico = self.historico[-24:]
+
+        return resp
+
+    def _comprimir_historico(self, msgs: list[dict]) -> list[dict]:
+        limite = CONFIG["max_historico_sessao"]
+        msgs_filtradas = [m for m in msgs if m.get("role") in ("user", "ai")]
+        return msgs_filtradas[-limite:]
+
+    def limpar(self):
+        self.historico.clear()
+        self.cache.limpar()
+
+    @staticmethod
+    def _remover_codigo(texto: str) -> str:
+        AVISO = "\n[Use /cod — lá eu gero esse código no Modo Programador.]\n"
+        t = re.sub(r'```[\w]*\s*\n.*?\n\s*```', AVISO, texto, flags=re.DOTALL)
+        t = re.sub(r'```.*?```', AVISO, t, flags=re.DOTALL)
+        t = re.sub(r'(\$Use /cod[^\$]+\$\n?){2,}', AVISO, t)
+        return t.strip()
+
+    @staticmethod
+    def _truncar_delirio(texto: str) -> str:
+        pos = len(texto)
+        for g in ("\nArthur:", "\nVocê:", "\nUser:", "\nUsuário:",
+                  "\nARTHUR:", "\nVOCÊ:", "\nUSER:"):
+            i = texto.find(g)
+            if i != -1 and i < pos:
+                pos = i
+        return texto[:pos].strip()
+
+
+# ══════════════════════════════════════════════════════════════
+#  SEGURANÇA — AST (mantido)
+# ══════════════════════════════════════════════════════════════
+
+class AnalisadorSeguranca:
+
+    @staticmethod
+    def analisar(codigo: str) -> tuple[bool, str]:
+        try:
+            arvore = ast.parse(codigo)
+        except SyntaxError as e:
+            return False, f"Sintaxe inválida: {e}"
+
+        for no in ast.walk(arvore):
+            if isinstance(no, ast.Call):
+                nome = AnalisadorSeguranca._nome(no)
+                if nome and nome in _CHAMADAS_BLOQUEADAS:
+                    return False, f"Chamada bloqueada: '{nome}'"
+
+            if isinstance(no, (ast.Import, ast.ImportFrom)):
+                mods = ([a.name for a in no.names] if isinstance(no, ast.Import)
+                        else [no.module or ""])
+                for mod in mods:
+                    raiz = mod.split(".")[0]
+                    if raiz and raiz not in _MODULOS_PERMITIDOS:
+                        pip = MODULOS_EXTERNOS.get(raiz, raiz)
+                        return False, (
+                            f"Módulo '{mod}' não está na lista permitida.\n"
+                            f"  → Para liberar: pip install {pip}"
+                        )
+        return True, "OK"
+
+    @staticmethod
+    def _nome(no: ast.Call) -> Optional[str]:
+        if isinstance(no.func, ast.Attribute) and isinstance(no.func.value, ast.Name):
+            return f"{no.func.value.id}.{no.func.attr}"
+        if isinstance(no.func, ast.Name):
+            return no.func.id
+        return None
+
+
+# ══════════════════════════════════════════════════════════════
+#  EXECUTOR (mantido)
+# ══════════════════════════════════════════════════════════════
+
+class Executor:
+
+    def __init__(self, sandbox: str):
+        self.sandbox = Path(sandbox)
+        self.sandbox.mkdir(exist_ok=True)
+
+    def executar(self, codigo: str) -> tuple[bool, str]:
+        ok, motivo = AnalisadorSeguranca.analisar(codigo)
+        if not ok:
+            return False, f"[BLOQUEADO] {motivo}"
+
+        nome    = f"exec_{int(time.time()*1000)}.py"
+        caminho = self.sandbox / nome
+        caminho.write_text(codigo, encoding="utf-8")
+
+        try:
+            env = os.environ.copy()
+            env.update({"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
+                        "PYTHONDONTWRITEBYTECODE": "1"})
+            r = subprocess.run(
+                [sys.executable, "-X", "utf8", str(caminho)],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                timeout=CONFIG["timeout_execucao"], env=env,
+            )
+            out = self._limpar(r.stdout).strip()
+            err = self._limpar(r.stderr).strip()
+            if r.returncode != 0:
+                return False, err or out or "Erro desconhecido"
+            if not out:
+                return False, "Código executou sem saída. Use print() FORA de funções."
+            return True, out
+        except subprocess.TimeoutExpired:
+            return False, f"Timeout: execução ultrapassou {CONFIG['timeout_execucao']}s."
+        except Exception as e:
+            return False, f"Erro ao executar: {e}"
+        finally:
+            try:
+                caminho.unlink()
+            except:
+                pass
+
+    @staticmethod
+    def _limpar(texto: str) -> str:
+        return "\n".join(l for l in texto.splitlines()
+                         if not any(r in l for r in RUIDO_DEBUGGER))
+
+
+# ══════════════════════════════════════════════════════════════
+#  PROMPTS (modo código) — ANTI-DIARREIA DE CÓDIGO (mantido)
+# ══════════════════════════════════════════════════════════════
+
+class PromptBuilder:
+
+    DIR_PROJETO: str = ""
+
+    @classmethod
+    def _base(cls) -> str:
+        return f"""\
+Você é o Pacheco AI v5.4, LIMA CORP, criado por Arthur Lima.
+PC do Arthur: GTX 1650, 8GB RAM, Ryzen 3 — escreva código eficiente pra esse hardware.
+Especialidade: Python, automação, Office, PDFs, dados, web, Telegram, Email, SMS.
+
+══ REGRA ANTI-DIARREIA DE CÓDIGO — CRÍTICA ══
+ENTREGUE APENAS O QUE FOI PEDIDO.
+- Se pediu uma função → escreva SÓ aquela função + chamada de teste.
+- Se pediu um script simples → NADA de classes desnecessárias, configs extras, menus.
+- Se pediu CSV → não adicione Excel, PDF e JSON sem pedir.
+- PROIBIDO adicionar features, opções, configurações ou "melhorias" não solicitadas.
+- Código limpo = menos linhas = mais valor. Escreva o mínimo necessário.
+- SEMPRE chame o que foi implementado e mostre resultado.
+═════════════════════════════════════════════
+
+REGRAS ABSOLUTAS:
+1. Responda APENAS com um único bloco ```python```. NADA fora dele.
+2. Código 100% independente, sem input() ou interação.
+3. SEMPRE use print() pra mostrar resultados.
+4. Se definir funções ou classes, CHAME-AS depois com print().
+5. PROIBIDO: eval, exec, compile, __import__
+6. Caminhos: sempre r"{cls.DIR_PROJETO}"
+7. Módulos instalados no PC do Arthur:
+   pandas, numpy, matplotlib, PIL (pillow), requests, httpx,
+   bs4, lxml, flask, fastapi, uvicorn, openpyxl, reportlab,
+   xlrd, xlwt, tqdm, rich, click, pydantic, dotenv, yaml, toml,
+   arrow, dateutil, pytz, humanize, tabulate, colorama,
+   cryptography, jwt, qrcode, barcode, docx (python-docx),
+   pptx (python-pptx), schedule, telegram (python-telegram-bot),
+   twilio, yagmail, psutil
+   STDLIB: os, sys, re, json, csv, pathlib, datetime, time, math,
+   sqlite3, hashlib, base64, uuid, threading, collections,
+   itertools, functools, webbrowser, subprocess, shutil, etc.
+8. IDIOMA: português brasileiro. Proibido espanhol.
+9. Verifique TODOS os nomes de variáveis antes de finalizar.
+10. NUNCA use Path(__file__) — script roda em pasta temporária.
+11. Word:  from docx import Document
+    PPT:   from pptx import Presentation
+    Excel: import openpyxl"""
+
+    @classmethod
+    def inicial(cls, pergunta: str, historico: str, similar: Optional[str]) -> str:
+        partes = [cls._base(), f"\nHISTÓRICO:\n{historico}"]
+        if similar:
+            partes.append(f"\nREFERÊNCIA ANTERIOR:\n```python\n{similar}\n```")
+        partes.append(f"\nTAREFA: {pergunta}")
+        return "\n".join(partes)
+
+    @classmethod
+    def correcao(cls, pergunta: str, codigo: str, erro: str, tentativa: int) -> str:
+        return (
+            f"{cls._base()}\n\nTAREFA: {pergunta}\n\n"
+            f"TENTATIVA {tentativa} FALHOU:\n{erro}\n\n"
+            f"CÓDIGO PROBLEMÁTICO:\n```python\n{codigo}\n```\n\n"
+            f"CORRIJA agora. Lembre: r\"{cls.DIR_PROJETO}\", print() fora de funções.\n"
+            "Responda SOMENTE com o ```python corrigido."
+        )
+
+
+# ══════════════════════════════════════════════════════════════
+#  CLIENTE OLLAMA (mantido)
+# ══════════════════════════════════════════════════════════════
+
+class ClienteOllama:
+
+    _LIXO_TOKENS = ("<html", "<!DOCTYPE", "<div", "<script", "<style", "<head", "<body")
+
+    def __init__(self):
+        self.session = requests.Session()
+
+    def verificar(self) -> bool:
+        try:
+            return self.session.get("http://localhost:11434", timeout=3).status_code == 200
+        except:
+            return False
+
+    def gerar(self, prompt: str, temperatura: Optional[float] = None,
+              modelo: Optional[str] = None, silencioso: bool = False) -> str:
+        if temperatura is None:
+            temperatura = CONFIG["temperatura_codigo"]
+        if modelo is None:
+            modelo = CONFIG["modelo"]
+
+        payload = {
+            "model": modelo,
+            "prompt": prompt,
+            "stream": True,
+            "options": {"temperature": temperatura, "num_predict": 2048}
+        }
+        resp = ""
+        try:
+            with self.session.post(CONFIG["url_ollama"], json=payload,
+                                   stream=True, timeout=CONFIG["timeout_resposta"]) as r:
+                r.raise_for_status()
+                for linha in r.iter_lines():
+                    if not linha:
+                        continue
+                    token = json.loads(linha.decode()).get("response", "")
+                    if any(lixo in resp + token for lixo in self._LIXO_TOKENS):
+                        break
+                    if not silencioso:
+                        print(token, end="", flush=True)
+                    resp += token
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError("Ollama offline. Execute: ollama serve")
+        return resp
+
+    def listar_modelos(self) -> list[str]:
+        try:
+            r = self.session.get("http://localhost:11434/api/tags", timeout=5)
+            return [m["name"] for m in r.json().get("models", [])]
+        except:
+            return []
+
+
+# ══════════════════════════════════════════════════════════════
+#  LOGGER (mantido)
+# ══════════════════════════════════════════════════════════════
+
+class Logger:
+
+    def __init__(self, pasta: str):
+        self.pasta   = Path(pasta)
+        self.pasta.mkdir(parents=True, exist_ok=True)
+        self.arquivo = self.pasta / f"sessao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    def log(self, nivel: str, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        with open(self.arquivo, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] [{nivel}] {msg}\n")
+
+
+# ══════════════════════════════════════════════════════════════
+#  PACHECO AI — NÚCLEO v5.4 (CORRIGIDO)
+# ══════════════════════════════════════════════════════════════
+
+class PachecoAI:
+
+    VERSAO = CONFIG["versao"]
+
+    def __init__(self):
+        self._criar_dirs()
+        PromptBuilder.DIR_PROJETO = str(PASTA_RAIZ)
+        self.db            = BancoDados(DB_PATH)
+        self.executor      = Executor(DIRETORIOS["sandbox"])
+        self.cliente       = ClienteOllama()
+        self.logger        = Logger(DIRETORIOS["logs"])
+        self.chat          = ModuloChat(self.cliente)
+        self.navegador     = ControladorNavegador()
+        self.modo_atual    = CONFIG["modo_padrao"]
+        self.sessao_atual  = Sessao(self.db)
+        self._nome_gerado  = False
+
+    def _criar_dirs(self):
+        for p in DIRETORIOS.values():
+            Path(p).mkdir(parents=True, exist_ok=True)
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+
+    def nova_sessao(self):
+        self.sessao_atual  = Sessao(self.db)
+        self._nome_gerado  = False
+        self.chat.historico = []
+
+    def carregar_sessao(self, id_sessao: str) -> bool:
+        dados = self.db.obter_sessao(id_sessao)
+        if not dados:
+            return False
+        self.sessao_atual  = Sessao(self.db, id_sessao)
+        self.modo_atual    = dados.get("modo", CONFIG["modo_padrao"])
+        self._nome_gerado  = (dados.get("nome") != "Nova conversa")
+        msgs = self.db.obter_mensagens(id_sessao, 24)
+        self.chat.historico = [m for m in msgs if m["role"] in ("user", "ai")]
+        return True
+
+    def _trocar_modo(self, novo_modo: str):
+        self.modo_atual = novo_modo
+        self.sessao_atual.set_modo(novo_modo)
+        nomes   = {"chat": "CONVERSA", "codigo": "PROGRAMADOR", "auto": "AUTOMÁTICO"}
+        modelos = {"chat": f"({CONFIG['modelo_chat']})", "codigo": f"({CONFIG['modelo']})", "auto": ""}
+        print(f"\n{ICONE_MODO.get(novo_modo, '')} Modo {nomes[novo_modo]} ativado. {modelos.get(novo_modo, '')}")
+
+    def _parsear_entrada(self, entrada: str) -> tuple[str, str]:
+        t, tl = entrada.strip(), entrada.strip().lower()
+        for pref, acao in _COMANDOS_RAPIDOS.items():
+            if tl == pref or tl.startswith(pref + " "):
+                return acao, t[len(pref):].strip()
+        if self.modo_atual == "auto":
+            return Classificador.classificar(t), t
+        return self.modo_atual, t
+
+    def _gerar_nome_se_necessario(self, msg: str):
+        if self._nome_gerado:
+            return
+        if self.sessao_atual.nome != "Nova conversa":
+            self._nome_gerado = True
+            return
+        msgs = self.db.obter_mensagens(self.sessao_atual.id, 5)
+        if len(msgs) <= 2:
+            nome = self.chat.gerar_nome(msg)
+            self.sessao_atual.nome = nome
+            self._nome_gerado = True
+
+    def rotear(self, entrada: str) -> None:
+        acao, texto = self._parsear_entrada(entrada)
+
+        if acao.startswith("modo:"):
+            self._trocar_modo(acao.split(":")[1])
+            return
+
+        dispatch = {
+            "hora":    lambda: self._cmd_rapido("hora"),
+            "data":    lambda: self._cmd_rapido("data"),
+            "versao":  lambda: self._cmd_rapido("versao"),
+            "memoria": self._cmd_memoria,
+            "config":  lambda: print(json.dumps(CONFIG, indent=2, ensure_ascii=False)),
+            "modulos": self._cmd_modulos,
+            "limpar":  self._cmd_limpar,
+            "ajuda":   self._cmd_ajuda,
+            "abrir":   lambda: print(f"\n{ControladorNavegador.abrir(texto)}"),
+            "sair":    lambda: (_ for _ in ()).throw(SystemExit("sair")),
+            "renomear": lambda: self._cmd_renomear(texto),
+            "apagar":   lambda: self._cmd_apagar(texto),
+            "sessoes":  lambda: self._cmd_sessoes(),
+        }
+
+        if acao in dispatch:
+            dispatch[acao]()
+            return
+
+        if acao == "chat":
+            compl = Classificador.estimar_complexidade(texto)
+            print(f"\n{ICONE_MODO['chat']} [{compl}] [{CONFIG['modelo_chat']}]\n")
+            self.sessao_atual.adicionar_msg("user", texto)
+            self._gerar_nome_se_necessario(texto)
+            msgs_hist = self.db.obter_mensagens(self.sessao_atual.id, 20)
+            resp = self.chat.responder(texto, compl, historico_sessao=msgs_hist[:-1])
+            self.sessao_atual.adicionar_msg("ai", resp)
+            print()
+            self.logger.log("CHAT", texto[:100])
+            return
+
+        if acao == "codigo":
+            print(f"\n{ICONE_MODO['codigo']} [PROGRAMADOR] [{CONFIG['modelo']}]\n")
+            self.sessao_atual.adicionar_msg("user", texto)
+            resultado = self.processar(texto)
+            if resultado["sucesso"]:
+                self.sessao_atual.adicionar_msg("ai", resultado["saida"])
+
+    # ─── PROCESSAR CÓDIGO CORRIGIDO (v5.4) ─────────────────
+    def processar(self, pergunta: str) -> dict:
+        resultado = {"pergunta": pergunta, "codigo": "", "saida": "", "sucesso": False, "tentativas": 0}
+        similar   = self.db.buscar_memoria_similar(pergunta)
+        if similar:
+            print("[Memória] Referência similar encontrada.\n")
+
+        # Contexto curto (3 últimos) agora em ordem cronológica correta
+        cur = self.db.conn.execute("""
+            SELECT usuario, sucesso FROM (
+                SELECT id, usuario, sucesso FROM memoria_longa ORDER BY id DESC LIMIT 3
+            ) ORDER BY id ASC
+        """)
+        ctx_curto = "\n".join(
+            f"[{'OK' if r['sucesso'] else 'FALHOU'}] {r['usuario'][:120]}"
+            for r in cur.fetchall()
+        ) or "(sem histórico)"
+
+        codigo_atual = erro_atual = ""
+
+        print("🧠 Pensando em silêncio... (validando lógica e sintaxe)")
+
+        for tentativa in range(1, CONFIG["max_tentativas"] + 1):
+            resultado["tentativas"] = tentativa
+            if tentativa == 1:
+                prompt = PromptBuilder.inicial(pergunta, ctx_curto, similar)
+            else:
+                prompt = PromptBuilder.correcao(pergunta, codigo_atual, erro_atual, tentativa)
+
+            resp = self.cliente.gerar(prompt, silencioso=True)  # sem flood no terminal
+
+            blocos = REGEX_CODIGO.findall(resp)
+            if not blocos:                     # <--- CORRIGIDO: era 'blocks'
+                erro_atual = "Nenhum bloco ```python``` na resposta."
+                continue
+
+            codigo_atual       = blocos[-1].strip()
+            resultado["codigo"] = codigo_atual
+
+            sucesso, saida        = self.executor.executar(codigo_atual)
+            resultado["saida"]    = saida
+            resultado["sucesso"]  = sucesso
+
+            if sucesso:
+                self.logger.log("SUCESSO", pergunta[:100])
+                break
+            else:
+                erro_atual = saida
+                self.logger.log("ERRO", f"T{tentativa}: {saida[:200]}")
+
+        # Exibe resultado final de forma limpa
+        print("─" * 55)
+        if resultado["sucesso"]:
+            print("✅ SUCESSO")
+        else:
+            print(f"❌ FALHOU após {resultado['tentativas']} tentativas")
+        print(resultado["saida"])
+        print("─" * 55)
+
+        self.db.salvar_memoria(pergunta, codigo_atual, resultado["sucesso"])
+        return resultado
+    # ────────────────────────────────────────────────────────
+
+    def _cmd_rapido(self, tipo: str):
+        a = datetime.now()
+        if tipo == "hora":
+            print(f"\nSão {a.strftime('%H:%M')} ⏰")
+        elif tipo == "data":
+            dias   = ["Segunda","Terça","Quarta","Quinta","Sexta","Sábado","Domingo"]
+            meses  = ["janeiro","fevereiro","março","abril","maio","junho",
+                      "julho","agosto","setembro","outubro","novembro","dezembro"]
+            print(f"\nHoje é {dias[a.weekday()]}, {a.day} de {meses[a.month-1]} de {a.year} 📅")
+        elif tipo == "versao":
+            print(f"\nPacheco AI Ω v{self.VERSAO} | LIMA CORP — by Arthur Lima 🤖")
+            modelos = self.cliente.listar_modelos()
+            print(f"  Chat:      {CONFIG['modelo_chat']}")
+            print(f"  Código:    {CONFIG['modelo']}")
+            print(f"  Módulos:   {len(_MODULOS_PERMITIDOS)} autorizados")
+            sessoes = self.db.listar_sessoes()
+            print(f"  Sessões:   {len(sessoes)}")
+            if modelos:
+                print(f"  Ollama:    {', '.join(modelos)}")
+
+    def _cmd_limpar(self):
+        self.chat.limpar()
+        print("\n🧹 Histórico da sessão e cache limpos.")
+
+    def _cmd_modulos(self):
+        cats = {
+            "Office":    ["docx","pptx","openpyxl","xlrd","xlwt","xlsxwriter"],
+            "PDF":       ["reportlab","PyPDF2","pdfplumber","fitz"],
+            "Dados/ML":  ["pandas","numpy","matplotlib","seaborn","plotly","scipy","sklearn"],
+            "Web":       ["requests","httpx","bs4","lxml","selenium","playwright"],
+            "Banco":     ["sqlalchemy","pymongo","redis","psycopg2","pymysql"],
+            "Automação": ["pyautogui","keyboard","mouse","schedule","watchdog","paramiko"],
+            "Imagem":    ["PIL","cv2"],
+            "Mensagens": ["telegram","twilio","yagmail","sendgrid"],
+            "Util":      ["rich","tqdm","click","pydantic","loguru","cryptography","qrcode"],
+            "Sistema":   ["psutil","GPUtil","pygetwindow","pytesseract"],
+        }
+        print(f"\n── MÓDULOS v{self.VERSAO} ({len(_MODULOS_PERMITIDOS)} total) ──")
+        for cat, mods in cats.items():
+            pips = " | ".join(f"{m}" for m in mods)
+            print(f"  {cat}: {pips}")
+
+    def _cmd_ajuda(self):
+        print(f"""
+┌─ PACHECO AI Ω v{self.VERSAO} ── AJUDA ─────────────────────────────┐
+│  💬 Chat:      {CONFIG['modelo_chat']:<48}│
+│  ⌨️  Código:   {CONFIG['modelo']:<48}│
+│                                                                 │
+│  MODO:    /chat  /cod  /auto                                    │
+│  INFO:    /hora  /data  /versao  /memoria  /modulos             │
+│  BROWSER: /abrir <url>   → abre no Chrome                       │
+│  SESSÃO:  /renomear <nome>   /apagar <id>   /sessoes            │
+│  OUTROS:  /limpar  /config  /ajuda  /sair                       │
+└─────────────────────────────────────────────────────────────────┘""")
+
+    def _cmd_memoria(self):
+        sessoes   = self.db.listar_sessoes()
+        total_mem = self.db.contar_memorias()
+        print(f"\n── MEMÓRIA v{self.VERSAO} ──")
+        print(f"Sessões salvas: {len(sessoes)} conversas (SQLite)")
+        print(f"Soluções salvas: {total_mem}")
+        print(f"Cache ativo: {len(self.chat.cache._cache)} entradas")
+
+    def _cmd_renomear(self, novo_nome: str):
+        if not novo_nome:
+            print("\n❌ Uso: /renomear <novo nome>")
+            return
+        self.sessao_atual.nome = novo_nome
+        print(f"\n✅ Sessão renomeada para: {novo_nome}")
+
+    def _cmd_apagar(self, id_sessao: str):
+        if not id_sessao:
+            print("\n❌ Uso: /apagar <id_sessao>  (veja os IDs com /sessoes)")
+            return
+        if not self.db.obter_sessao(id_sessao):
+            print(f"\n❌ Sessão '{id_sessao}' não encontrada.")
+            return
+        self.db.deletar_sessao(id_sessao)
+        if id_sessao == self.sessao_atual.id:
+            print(f"\n🗑️  Sessão atual '{id_sessao}' foi apagada. Iniciando nova sessão.")
+            self.nova_sessao()
+        else:
+            print(f"\n🗑️  Sessão '{id_sessao}' apagada com sucesso.")
+
+    def _cmd_sessoes(self):
+        sessoes = self.db.listar_sessoes()
+        if not sessoes:
+            print("\nNenhuma sessão encontrada.")
+            return
+        print(f"\n── SESSÕES SALVAS ({len(sessoes)}) ──")
+        print(f"{'ID':<28} {'Nome':<35} {'Modo':<8} {'Msgs':<5} {'Atualizada'}")
+        print("─" * 100)
+        for s in sessoes:
+            print(f"{s['id']:<28} {s['nome'][:34]:<35} {s['modo']:<8} {s['total']:<5} {s['atualizada'][:19]}")
+        print(f"\nDica: use /apagar <id> para remover uma sessão.")
+
+    def executar(self):
+        print(f"\n  PACHECO AI Ω v{self.VERSAO} | LIMA CORP  by Arthur Lima")
+        if not self.cliente.verificar():
+            print("\n❌ Ollama offline! Execute: ollama serve")
+            return
+
+        modelos   = self.cliente.listar_modelos()
+        sessoes   = self.db.listar_sessoes()
+        total_mem = self.db.contar_memorias()
+        print(f"\n  💬 Chat:   {CONFIG['modelo_chat']}")
+        print(f"  ⌨️  Código: {CONFIG['modelo']}")
+        print(f"  Módulos:   {len(_MODULOS_PERMITIDOS)} autorizados")
+        print(f"  Sessões:   {len(sessoes)} (SQLite)")
+        print(f"  Memória:   {total_mem} soluções")
+        if modelos:
+            print(f"  Ollama:    {', '.join(modelos)}")
+        print("\n/chat · /cod · /auto · /renomear · /apagar · /sessoes · /ajuda\n")
+
+        while True:
+            try:
+                print(f"\nVOCÊ {ICONE_MODO.get(self.modo_atual, '')}: ", end="")
+                entrada = input()
+                if entrada.strip():
+                    self.rotear(entrada)
+
+            except SystemExit as e:
+                if str(e) == "sair":
+                    print("\nFalou, Arthur! 👋")
+                self.db.fechar()
+                break
+            except KeyboardInterrupt:
+                print("\n[Ctrl+C] Use /sair pra encerrar.")
+            except RuntimeError as e:
+                print(f"\n❌ ERRO: {e}")
+                break
+            except Exception as e:
+                import traceback
+                print(f"\n❌ [ERRO] {e}\n{traceback.format_exc()}")
+                self.logger.log("FATAL", traceback.format_exc())
+
+
+if __name__ == "__main__":
+    ai = PachecoAI()
+    ai.executar()
